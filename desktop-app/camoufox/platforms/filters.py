@@ -1,0 +1,390 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+BossClaw 隐身引擎 —— 「基础求职条件」跨平台筛选参数映射层
+====================================================================
+设置页「求职偏好 → 基础求职条件」（目标城市 / 薪资期望 / 求职类型 / 学历要求 /
+经验要求 / 公司规模）是**全平台共用**的一份配置；四个平台的筛选参数名与码值体系
+各不相同，本模块把同一份条件翻译成各平台自己的查询参数，供猎聘 / 智联 / 前程无忧
+三个隐身采集模块复用（BOSS 由 searchUrl.ts + webview.cjs 处理，不走这里）。
+
+统一入口
+--------
+    normalize_criteria(raw)                 归一化设置页配置（去空白 / 去「不限」/ 去重）
+    build_filter_params(platform, criteria) -> dict[str, str]   平台参数（无值则不含该 key）
+    summarize_applied(platform, params)     -> str   日志用「已应用筛选」摘要
+    FILTER_CAPABILITIES                     能力表（置信度 + 码值来源，供诊断与文档）
+
+口径来源（2026-09 联网核对 / 2026-10-01 用户真机点选实测，逐条标注置信度）
+--------------------------------------------------------
+【猎聘 liepin】参数名：workYearCode / eduLevel / compScale / compKind / pubTime
+  · eduLevel（ok，2026-10-01 用户实测逐值确认）：010 博士 / 030 硕士 / 040 本科 / 050 大专
+    （用户点选链接逐一核对）；020 MBA·EMBA / 060 中专 / 070 中技 / 080 高中 / 090 初中
+    为猎聘学历字典码，设置页无对应项故不参与。
+  · workYearCode（partial，2026-10-01 用户实测）：区间式**单值**「起始$结束」——
+    应届生 1 / 实习生 2 / 0$1 = 1年以内 / 1$3 = 1-3年 / 3$5 = 3-5年 / 10$999 = 10年以上
+    为实测值；5$10 = 5-10年 按相邻区间边界规律推得（0$1 → 1$3 → 3$5 → 5$…）。
+    `$` 是**区间分隔**而非多选分隔，因此不支持多选拼接（多选时取第一个可映射项）。
+  · compScale（partial，2026-10-01 用户实测 010/020/030/040；050~080 按平台面板顺序
+    「1-49 / 50-99 / 100-499 / 500-999 / 1000-2000 / 2000-5000 / 5000-10000 / 10000以上」
+    推得）：平台为**单选**，设置页「20-99人」「1000-9999人」跨多个平台档 → 无法单值表达，
+    不附加（宁可多召回不误杀）；设置页「0-20人」并入平台「1-49人」。
+  · compKind（partial，用户实测 外企 010 / 中外合资 020）：平台面板顺序为
+    「外商独资·外企办事处 / 中外合营(合资·合作) / 私营·民营企业 / 国有企业 / 国内上市公司 /
+    政府机关·非盈利机构 / 事业单位 / 其他」→ 010~080 顺位推得 民营 030 / 国企 040 / 其他 080；
+    设置页「港澳台企业」「机关/事业单位」在平台无单值对应 → 不附加。
+  · pubTime（partial，用户实测「一天以内」1 /「三天以内」3）：为**招聘者活跃**时间窗；
+    一周以内 7 / 一个月以内 30 按天数规律推得。由设置页「HR 活跃度过滤」映射（窗口越窄阈值越高）。
+  · compStage（partial，2026-10-01 用户实测 A轮 02 / B轮 03）：平台面板为
+    「天使轮 / A轮 / B轮 / C轮 / D轮及以上 / 已上市 / 战略融资 / 融资未公开」→ 01~08 顺位；
+    设置页已并列猎聘口径选项（与智联的「不需要融资/未融资/有融资」并存，后者在猎聘不附加）。
+    多选拼接分隔符未实测（暂按本平台 `$`），多值不可解析时平台会退化为不筛（多召回，不误杀）。
+  · jobKind（unsupported）：猎聘搜索面板无「求职类型」筛选（用户实测确认）→ 不附加。
+【智联 zhaopin】参数名：el / we / ct / fs / cs / et / sl
+  · el（ok，2026-09 实测 URL 逐值验证）：1 博士 / 3 硕士 / 4 本科 / 5 大专 / 7 高中
+    （访问 www.zhaopin.com/sou/jl530/p1?el=1/3/4/5/7 结果分别只见对应学历岗位；
+    中专 / 初中 / MBA 非设置页选项且码值未验证 → 不附加，宁可不筛不误筛）。
+  · we（ok）：-1 经验不限 / 0001 1年以下 / 0103 1-3年 / 0305 3-5年 / 0510 5-10年
+    （用户实测链接 ?we=0001%2C0103%2C0305%2C0510；设置页「1年以内」同 0001）；
+    0000 无经验 / 1099 10年以上 为字典码未逐值验证 → 附码但标注未实测。
+  · ct（ok，用户实测链接）：1 国企 / 2 外企 / 5 民营 / 4 中外合资 / 16 港澳台企业 /
+   6;10 机关/事业单位 / 7;14;15 其他（类型内「;」、类型间「,」，与 fs 同规则）。
+  · fs（partial，实测 URL）：8 不需要融资 / 1 未融资（?fs=8%2C1）/
+    有融资聚合组 2;3;4;5;6（用户实测 ?fs=2%3B3%3B4%3B5%3B6%2C1）；单轮次码值未逐档验证 → 不附加。
+  · cs（ok，用户实测链接 ?cs=2%2C3%2C8%2C4 = 20-99/100-299/300-499/500-999）：
+    2=20-99人、3=100-299人、8=300-499人、4=500-999人；智联把 100-499 拆两档，
+    设置页「100-499人」聚合为 cs=3,8；1=20人以下 / 5=1000-9999人 / 6=10000人以上
+    为字典码未逐档实测。
+  · et（ok，用户提供实测链接）：职位类型；2 全职 / 4 实习 / 1 兼职 / 5 校招。
+【前程无忧 job51】参数名：workYear / degree / companySize / jobType（实测页面筛选面板一致）
+  · 码值为 2 位顺位编码（01 起），与平台旧版筛选字段 workyear / degreefrom / jobterm /
+    companysize 的口径一致（旧版实测 URL 出现 degreefrom=04、jobterm=01）。新版码值
+    无法直连实测（Aliyun WAF 拦脚本请求）→ 整体标记 inferred。
+  · 可在真机登录后逐项校准：改下面的 JOB51_* 表即可，无需改动调用方。
+"""
+from __future__ import annotations
+
+from typing import Any, Iterable
+
+# ============================================================
+# 通用归一化
+# ============================================================
+# 「经验不限」是智联的可筛选项（we=-1，见 ZHAOPIN_EXP），因此**不**归入 NO_FILTER_WORDS；
+# 其余平台无对应码值时会自然跳过（不附加）。
+NO_FILTER_WORDS = ('', '不限', '全部', '不限制', '所有', '不限学历', '全国')
+
+# 多值连接符（各平台多选参数的分隔符不同；猎聘用 `$`，投递类平台用 `,`）
+MULTI_SEP = {'liepin': '$', 'zhaopin': ',', 'job51': ','}
+
+# 区间式**单值**维度（P6-12）：值形如「起始$结束」（猎聘 workYearCode 1$3=1-3年），
+# $ 是区间分隔而非多选分隔——摘要反查时整体展示，禁止按分隔符拆开（否则 9$12 显示成 9/12）。
+_RANGE_SINGLE_DIMS = {('liepin', 'experience')}
+
+
+def _clean_one(value: Any) -> str:
+    v = str(value or '').strip()
+    return '' if v in NO_FILTER_WORDS else v
+
+
+def _clean_list(value: Any) -> list[str]:
+    """字符串 / 列表 → 去空、去「不限」、去重且保持原顺序。"""
+    if value is None:
+        return []
+    raw: Iterable[Any]
+    if isinstance(value, (list, tuple, set)):
+        raw = value
+    else:
+        raw = str(value).replace('，', ',').replace('、', ',').replace(';', ',').split(',')
+    out: list[str] = []
+    for item in raw:
+        v = _clean_one(item)
+        if v and v not in out:
+            out.append(v)
+    return out
+
+
+def normalize_criteria(raw: dict | None) -> dict:
+    """设置页「基础求职条件」→ 归一化条件字典。
+
+    入参兼容 camelCase（前端 AppConfig）与 snake_case：
+      experiences / experience、degrees / degree、companyScale / scale、
+      employmentTypes / jobType / job_type、salary、companyType / company_type、
+      financing / financeStages / finance_stages、hrActivity / hr_activity / hrActivityFilter
+    出参：{salary: str, experience: [str], degree: [str], scale: str, job_type: [str],
+           company_type: str, financing: [str], hr_activity: str}
+    """
+    src = raw if isinstance(raw, dict) else {}
+
+    def pick(*keys: str):
+        for k in keys:
+            if k in src and src[k] not in (None, ''):
+                return src[k]
+        return None
+
+    return {
+        'salary': _clean_one(pick('salary')),
+        'experience': _clean_list(pick('experiences', 'experience')),
+        'degree': _clean_list(pick('degrees', 'degree')),
+        'scale': _clean_one(pick('companyScale', 'company_scale', 'scale')),
+        'job_type': _clean_list(pick('employmentTypes', 'employment_types', 'jobType', 'job_type')),
+        # 公司性质（单值）与融资阶段（可多选）——智联已实测接通，猎聘 company_type 已接通
+        'company_type': _clean_one(pick('companyType', 'company_type')),
+        'financing': _clean_list(pick('financing', 'financeStages', 'finance_stages')),
+        # HR 活跃度过滤阈值（单值枚举 any/month/week/3days/today/justActive/online）：
+        # 目前只有猎聘有对应平台筛选（pubTime 时间窗），其余平台忽略
+        'hr_activity': _clean_one(pick('hrActivity', 'hr_activity', 'hrActivityFilter')),
+    }
+
+
+# ============================================================
+# 猎聘 liepin
+# ============================================================
+# 学历码（猎聘学历字典；2026-10-01 用户实测逐值确认 010 博士 / 030 硕士 / 040 本科 / 050 大专）
+LIEPIN_EDU = {
+    '博士': '010', 'MBA/EMBA': '020', '硕士': '030', '本科': '040', '大专': '050',
+    '中专': '060', '中技': '070', '高中': '080', '初中及以下': '090', '初中': '090',
+}
+# 经验码（区间式单值「起始$结束」；2026-10-01 用户实测 应届生 1 / 实习生 2 / 0$1 / 1$3 / 3$5 /
+# 10$999；5$10 按相邻区间边界规律推得）。设置页「在校生」对应平台「实习生」。
+LIEPIN_WORK_YEAR = {
+    '在校生': '2', '实习生': '2',
+    '应届生': '1',
+    '1年以内': '0$1', '1-3年': '1$3', '3-5年': '3$5', '5-10年': '5$10', '10年以上': '10$999',
+}
+# 公司规模码（2026-10-01 用户实测 1-49 人 010 / 50-99 人 020 / 100-499 人 030 / 500-999 人 040；
+# 050~080 按平台面板顺序推得）。平台为单选 8 档；设置页「0-20人」并入 1-49人，
+# 「20-99人」「1000-9999人」跨多档 → 不在表内（不附加，宁可多召回不误杀）。
+# ⚠️ 反查（日志摘要）取本表**最后**写入的值：设置页别名必须排在平台标签之前。
+LIEPIN_SCALE = {
+    '0-20人': '010',
+    '1-49人': '010', '50-99人': '020', '100-499人': '030', '500-999人': '040',
+    '1000-2000人': '050', '2000-5000人': '060', '5000-10000人': '070', '10000人以上': '080',
+}
+# 企业性质码（compKind；用户实测 外企 010 / 中外合资 020，其余按平台面板顺序推得）。
+# 设置页「港澳台企业」「机关/事业单位」在平台无单值对应 → 不在表内。
+LIEPIN_COMPANY_TYPE = {
+    '外企': '010', '中外合资': '020', '民营': '030', '国企': '040', '其他': '080',
+}
+# HR 活跃度过滤（设置页枚举）→ 猎聘「招聘者活跃」pubTime 时间窗（天）。
+# 用户实测 一天以内 1 / 三天以内 3；一周以内 7 / 一个月以内 30 按天数规律推得。
+# 阈值越高 → 窗口越窄；设置页「仅在线」在猎聘无对应窗口 → 不在表内。
+LIEPIN_HR_ACTIVITY = {
+    'month': '30', 'week': '7', '3days': '3', 'today': '1', 'justActive': '1',
+}
+# 融资阶段码（compStage；2026-10-01 用户实测 A轮 02 / B轮 03，其余按平台面板顺序推得 01~08）。
+# 键为**猎聘口径**面板选项名（设置页已并列这些选项）；智联口径的「不需要融资/未融资/有融资」
+# 不在本表 → 在猎聘不附加。
+LIEPIN_FINANCING = {
+    '天使轮': '01', 'A轮': '02', 'B轮': '03', 'C轮': '04',
+    'D轮及以上': '05', '已上市': '06', '战略融资': '07', '融资未公开': '08',
+}
+
+
+def _liepin_params(c: dict) -> dict:
+    out: dict = {}
+    # 经验：猎聘 workYearCode 是**区间式单值**（`1$3` 本身即 "1-3年"，`$` 是区间分隔而非多选分隔），
+    # 因此多选无法拼接（拼成 `1$3$3$5` 会解析失败）→ 只取用户第一个可映射的经验项。
+    for k in c['experience']:
+        if k in LIEPIN_WORK_YEAR:
+            out['workYearCode'] = LIEPIN_WORK_YEAR[k]
+            break
+    edu = [LIEPIN_EDU[k] for k in c['degree'] if k in LIEPIN_EDU]
+    if edu:
+        out['eduLevel'] = MULTI_SEP['liepin'].join(edu)
+    if c['scale'] in LIEPIN_SCALE:
+        out['compScale'] = LIEPIN_SCALE[c['scale']]
+    if c['company_type'] in LIEPIN_COMPANY_TYPE:
+        out['compKind'] = LIEPIN_COMPANY_TYPE[c['company_type']]
+    hr = LIEPIN_HR_ACTIVITY.get(c['hr_activity'])
+    if hr:
+        out['pubTime'] = hr
+    fs = [LIEPIN_FINANCING[k] for k in c['financing'] if k in LIEPIN_FINANCING]
+    if fs:
+        out['compStage'] = MULTI_SEP['liepin'].join(fs)
+    # jobKind（求职类型）：猎聘搜索面板无此筛选 → 不附加
+    return out
+
+
+# ============================================================
+# 智联招聘 zhaopin
+# ============================================================
+# 学历码（2026-09 实测 URL ?el=N：1 博士 / 3 硕士 / 4 本科 / 5 大专 / 7 高中；中专/初中/MBA 未验证不附加）
+ZHAOPIN_EDU = {
+    '博士': '1', '硕士': '3', '本科': '4', '大专': '5', '高中': '7',
+}
+# 经验码（we，用户实测多选链接 ?we=0001%2C0103%2C0305%2C0510 = 1年以下/1-3年/3-5年/5-10年；
+# -1 经验不限 / 0000 无经验 / 1099 10年以上 为字典码未逐值验证；设置页标签「1年以内」同 0001）
+ZHAOPIN_EXP = {
+    '经验不限': '-1', '无经验': '0000', '1年以下': '0001', '1年以内': '0001',
+    '1-3年': '0103', '3-5年': '0305', '5-10年': '0510', '10年以上': '1099',
+}
+# 公司性质码（ct，用户实测链接）：1 国企 / 2 外企 / 5 民营；其余单档实测：
+#   中外合资=4（?ct=4）· 港澳台企业=16（?ct=16）· 机关/事业单位=6;10（?ct=6%3B10）·
+#   其他=7;14;15（由组合链接 ?ct=4%2C16%2C6%3B10%2C7%3B14%3B15 反推：类型间「,」、类型内「;」，
+#   与 fs 的「组内 ';'、组间 ','」同一规则）。设置页为单选 → 整体透传；单码值直接附加。
+ZHAOPIN_COMPANY_TYPE = {
+    '国企': '1', '外企': '2', '民营': '5',
+    '中外合资': '4', '港澳台企业': '16', '机关/事业单位': '6;10', '其他': '7;14;15',
+}
+# 融资阶段码（fs，实测 URL）：8 不需要融资 / 1 未融资（?fs=8%2C1）；
+# 「有融资」是聚合组 2;3;4;5;6（用户实测 ?fs=2%3B3%3B4%3B5%3B6%2C1，组内用「;」、
+# 与其他档位用「,」连接）；各轮次单档码（天使轮/A轮…）未逐档验证 → 只提供聚合，不臆造单档。
+ZHAOPIN_FINANCING = {
+    '不需要融资': '8', '未融资': '1', '有融资': '2;3;4;5;6',
+}
+# 公司规模码（cs，用户实测链接 ?cs=2%2C3%2C8%2C4 = 20-99/100-299/300-499/500-999：
+# 2=20-99人、3=100-299人、8=300-499人、4=500-999人；智联把 100-499 拆成「100-299」与
+# 「300-499」两档 → 设置页单档「100-499人」映射聚合 cs=3,8；1=20人以下/5=1000-9999人/
+# 6=10000人以上 为字典码未逐档实测）
+ZHAOPIN_SCALE = {
+    '0-20人': '1', '20人以下': '1', '20-99人': '2', '100-299人': '3',
+    '300-499人': '8', '100-499人': '3,8', '500-999人': '4',
+    '1000-9999人': '5', '10000人以上': '6',
+}
+# 职位类型码（et，用户提供实测链接：?et=2 全职 / ?et=4 实习 / ?et=1%2C5 兼职+校招）
+ZHAOPIN_JOB_TYPE = {
+    '全职': '2', '实习': '4', '校招': '5', '兼职': '1',
+}
+
+
+def _zhaopin_params(c: dict) -> dict:
+    out: dict = {}
+    exp = [ZHAOPIN_EXP[k] for k in c['experience'] if k in ZHAOPIN_EXP]
+    if exp:
+        out['we'] = MULTI_SEP['zhaopin'].join(exp)
+    edu = [ZHAOPIN_EDU[k] for k in c['degree'] if k in ZHAOPIN_EDU]
+    if edu:
+        out['el'] = MULTI_SEP['zhaopin'].join(edu)
+    if c['scale'] in ZHAOPIN_SCALE:
+        out['cs'] = ZHAOPIN_SCALE[c['scale']]
+    if c['company_type'] in ZHAOPIN_COMPANY_TYPE:
+        out['ct'] = ZHAOPIN_COMPANY_TYPE[c['company_type']]
+    fs = [ZHAOPIN_FINANCING[k] for k in c['financing'] if k in ZHAOPIN_FINANCING]
+    if fs:
+        out['fs'] = MULTI_SEP['zhaopin'].join(fs)
+    jt = [ZHAOPIN_JOB_TYPE[k] for k in c['job_type'] if k in ZHAOPIN_JOB_TYPE]
+    if jt:
+        out['et'] = MULTI_SEP['zhaopin'].join(jt)
+    return out
+
+
+# ============================================================
+# 前程无忧 job51（码值 inferred：顺位 2 位编码，待真机登录后校准）
+# ============================================================
+JOB51_WORK_YEAR = {
+    '在校生': '01', '应届生': '01', '1-3年': '02', '3-5年': '03',
+    '5-10年': '04', '10年以上': '05',
+}
+JOB51_DEGREE = {
+    '初中及以下': '01', '高中': '02', '中专/中技': '02', '中专': '02', '中技': '02',
+    '大专': '03', '本科': '04', '硕士': '05', '博士': '06',
+}
+JOB51_SCALE = {
+    '0-20人': '01', '20人以下': '01', '20-99人': '02', '100-499人': '03',
+    '500-999人': '04', '1000-9999人': '05', '10000人以上': '06',
+}
+JOB51_JOB_TYPE = {'全职': '01', '兼职': '02', '实习': '03'}
+
+
+def _job51_params(c: dict) -> dict:
+    out: dict = {}
+    exp = [JOB51_WORK_YEAR[k] for k in c['experience'] if k in JOB51_WORK_YEAR]
+    if exp:
+        out['workYear'] = MULTI_SEP['job51'].join(dict.fromkeys(exp))
+    deg = [JOB51_DEGREE[k] for k in c['degree'] if k in JOB51_DEGREE]
+    if deg:
+        out['degree'] = MULTI_SEP['job51'].join(dict.fromkeys(deg))
+    if c['scale'] in JOB51_SCALE:
+        out['companySize'] = JOB51_SCALE[c['scale']]
+    jt = [JOB51_JOB_TYPE[k] for k in c['job_type'] if k in JOB51_JOB_TYPE]
+    if jt:
+        out['jobType'] = MULTI_SEP['job51'].join(dict.fromkeys(jt))
+    return out
+
+
+# ============================================================
+# 能力表 / 统一入口
+# ============================================================
+_BUILDERS = {
+    'liepin': _liepin_params,
+    'zhaopin': _zhaopin_params,
+    'job51': _job51_params,
+}
+
+# ok = 码值有权威来源或实测；partial = 部分取值有实测；inferred = 顺位推得待校准；
+# unsupported = 码值未知，按「不臆造码、宁可多召回不误杀」原则不附加。
+FILTER_CAPABILITIES: dict[str, dict[str, str]] = {
+    'liepin': {'experience': 'partial', 'degree': 'ok', 'scale': 'partial', 'job_type': 'unsupported',
+               'company_type': 'partial', 'financing': 'partial', 'hr_activity': 'partial'},
+    'zhaopin': {'experience': 'ok', 'degree': 'ok', 'scale': 'ok', 'job_type': 'ok',
+                'company_type': 'ok', 'financing': 'partial', 'hr_activity': 'unsupported'},
+    'job51': {'experience': 'inferred', 'degree': 'inferred', 'scale': 'inferred', 'job_type': 'inferred',
+              'company_type': 'unsupported', 'financing': 'unsupported', 'hr_activity': 'unsupported'},
+}
+
+# 条件维度 → 平台查询参数名（日志 / 诊断用）
+PARAM_NAMES: dict[str, dict[str, str]] = {
+    'liepin': {'experience': 'workYearCode', 'degree': 'eduLevel', 'scale': 'compScale',
+               'company_type': 'compKind', 'hr_activity': 'pubTime', 'financing': 'compStage'},
+    'zhaopin': {'experience': 'we', 'degree': 'el', 'scale': 'cs', 'job_type': 'et',
+                'company_type': 'ct', 'financing': 'fs'},
+    'job51': {'experience': 'workYear', 'degree': 'degree', 'scale': 'companySize', 'job_type': 'jobType'},
+}
+
+
+# 码值 → 中文标签（日志摘要反查用；避免把「平台侧实际未生效的选项」显示成已应用）
+_REVERSE_CODES: dict[tuple[str, str], dict] = {
+    ('liepin', 'experience'): {v: k for k, v in LIEPIN_WORK_YEAR.items()},
+    ('liepin', 'degree'): {v: k for k, v in LIEPIN_EDU.items()},
+    # 公司规模/企业性质反查取**平台标签**（表内设置页别名在前、平台标签在后）
+    ('liepin', 'scale'): {v: k for k, v in LIEPIN_SCALE.items()},
+    ('liepin', 'company_type'): {v: k for k, v in LIEPIN_COMPANY_TYPE.items()},
+    # HR 活跃度反查按平台口径窗口名展示（today/justActive 同为 1，取平台窗口名）
+    ('liepin', 'hr_activity'): {'30': '一个月以内', '7': '一周以内', '3': '三天以内', '1': '一天以内'},
+    ('liepin', 'financing'): {v: k for k, v in LIEPIN_FINANCING.items()},
+    ('zhaopin', 'experience'): {v: k for k, v in ZHAOPIN_EXP.items()},
+    ('zhaopin', 'degree'): {v: k for k, v in ZHAOPIN_EDU.items()},
+    ('zhaopin', 'scale'): {v: k for k, v in ZHAOPIN_SCALE.items()},
+    ('zhaopin', 'company_type'): {v: k for k, v in ZHAOPIN_COMPANY_TYPE.items()},
+    ('zhaopin', 'financing'): {v: k for k, v in ZHAOPIN_FINANCING.items()},
+    ('zhaopin', 'job_type'): {v: k for k, v in ZHAOPIN_JOB_TYPE.items()},
+    ('job51', 'experience'): {v: k for k, v in JOB51_WORK_YEAR.items()},
+    ('job51', 'degree'): {v: k for k, v in JOB51_DEGREE.items()},
+    ('job51', 'scale'): {v: k for k, v in JOB51_SCALE.items()},
+    ('job51', 'job_type'): {v: k for k, v in JOB51_JOB_TYPE.items()},
+}
+
+
+def build_filter_params(platform: str, criteria: dict | None) -> dict:
+    """把「基础求职条件」翻译成指定平台的查询参数（无对应码值的维度自动省略）。"""
+    p = str(platform or '').strip().lower()
+    builder = _BUILDERS.get(p)
+    if builder is None:
+        return {}
+    return builder(normalize_criteria(criteria))
+
+
+def summarize_applied(platform: str, params: dict) -> str:
+    """日志摘要：`学历=本科 · 经验=1-3年 · 公司规模=100-499人`（由码值反查中文，单值整体优先）。
+
+    只列出**实际附加到搜索参数里**的维度：平台侧暂无码值的维度不会出现，
+    避免用户把「设置里选了但平台未生效」误认为已应用（能力表见 FILTER_CAPABILITIES）。
+    """
+    p = str(platform or '').strip().lower()
+    names = {'experience': '经验', 'degree': '学历', 'scale': '公司规模', 'job_type': '求职类型',
+             'company_type': '公司性质', 'financing': '融资阶段', 'hr_activity': 'HR活跃度'}
+    sep = MULTI_SEP.get(p, ',')
+    parts = []
+    for dim, pname in (PARAM_NAMES.get(p) or {}).items():
+        v = params.get(pname)
+        if not v:
+            continue
+        rev = _REVERSE_CODES.get((p, dim)) or {}
+        if v in rev:  # 区间式/单值（如猎聘 1$3）整体命中
+            labels = [rev[v]]
+        elif (p, dim) in _RANGE_SINGLE_DIMS:
+            labels = [v]  # 区间式单值：不按分隔符拆，原样展示（避免 9$12 被误拆成 9/12）
+        else:
+            labels = [rev.get(code, code) for code in v.split(sep) if code]
+        parts.append(f"{names[dim]}={'/'.join(labels)}")
+    return ' · '.join(parts)

@@ -1,0 +1,2583 @@
+// electron/main.cjs —— BossClaw 桌面版主进程（CommonJS）
+// 单窗口 + webview（内置浏览器，默认引擎） + 安全 IPC。
+// 启动 OpenClaw 本地桥接服务，并通过 contextBridge 暴露 webview 预加载路径。
+// CloakBrowser 隐身引擎作为**可选**内置浏览器（用户设置切换；与 webview 平行运行）。
+'use strict';
+
+const { app, BrowserWindow, ipcMain, shell, Menu, session, clipboard, dialog, nativeImage } = require('electron');
+const path = require('node:path');
+const fs = require('node:fs');
+const crypto = require('node:crypto');
+const os = require('node:os');
+const { spawn, execFile } = require('node:child_process');
+// 本地控制桥（供外部 agent / MCP 操作运行中的应用；默认关闭，见 control-bridge.cjs 的开启条件）
+const { startControlBridge, resolveEnablement } = require('./control-bridge.cjs');
+// 内置浏览器「主世界」反检测补丁 + 指纹自检（补丁本体与探针同一模块，见文件头说明）
+const stealth = require('./preload/stealth.cjs');
+
+// ===== 轻量日志：仅在 BOSSCLAW_DEBUG=1 或开发模式写文件；正常情况只走 console =====
+// 延迟访问 app（顶层 require 时 app 可能尚未就绪），且不影响其它调用方读取 dlog。
+let _debugLogEnabled = null;
+// P4-12 / 审查 #14：jc:webview-input 频率兜底的滑动窗口（近 60s 时间戳）——**按 guest webContents 分桶**。
+// 原实现是模块级单一数组，所有标签页共用 60 条/分钟额度：一个标签页的高频动作会耗尽额度，
+// 使另一标签页的正常投递被误判「输入风暴」拒绝（表现为对端标签页莫名失败、日志显示 rate limited）。
+const inputWindows = new Map(); // senderId(number) -> number[]（时间戳）
+// 审查 H-14：已注册过 destroyed 清理的 guest webContents（WeakSet，随对象回收）——避免重复注册监听器
+const inputDestroyHooked = new WeakSet();
+function inputWindowFor(id) {
+  let arr = inputWindows.get(id);
+  if (!arr) { arr = []; inputWindows.set(id, arr); }
+  return arr;
+}
+function isDebugEnabled() {
+  if (_debugLogEnabled !== null) return _debugLogEnabled;
+  // process.env 在 require 阶段即可访问；app.isPackaged 仅在 app 已 require 后才可用，
+  // 这里延后到首次 dlog 调用时判定（此时 main.cjs 已被 Electron 主进程加载，app 必然就绪）。
+  // BOSSCLAW_DEBUG=0 为**显式硬关**（优先于「未打包即开」），便于在开发机上验证「正式包不写盘」的行为。
+  const envVal = process.env.BOSSCLAW_DEBUG;
+  if (envVal === '0' || envVal === 'false') { _debugLogEnabled = false; return _debugLogEnabled; }
+  _debugLogEnabled = envVal === '1' || (() => {
+    try { return !app.isPackaged; } catch { return false; }
+  })();
+  return _debugLogEnabled;
+}
+let _debugLogPath = null;
+function getDebugLogPath() {
+  if (_debugLogPath) return _debugLogPath;
+  try { _debugLogPath = path.join(app.getPath('userData'), 'bossclaw-debug.log'); }
+  catch { _debugLogPath = null; }
+  return _debugLogPath;
+}
+function dlog(level, msg, extra) {
+  const line = `[${new Date().toISOString()}] [${level}] ${msg}${extra ? ' ' + safeStringify(extra) : ''}`;
+  if (isDebugEnabled()) {
+    const p = getDebugLogPath();
+    if (p) { try { fs.appendFileSync(p, line + '\n'); } catch {} }
+  }
+  if (level === 'error') console.error(line);
+  else if (level === 'warn') console.warn(line);
+}
+function safeStringify(obj) {
+  try { return JSON.stringify(obj); } catch { return String(obj); }
+}
+
+/**
+ * 兼容解析 webContents 的 console-message 事件参数。
+ *
+ * - Electron 31 及以前：(event, level, message, line, sourceId)
+ * - Electron 42 起：首参已变为携带字段的对象 { frame, level, message, lineNumber, sourceId, _level }，
+ *   同时仍会传入位置参数（实测 argCount=5）。旧的 (level, message) 取法在 42 下碰巧仍可用，
+ *   但官方已标注 "arguments are deprecated and will be removed"，故此处统一收敛，避免将来断裂。
+ *
+ * 返回 { level, message, line, sourceId }。
+ */
+function parseConsoleMessage(a, b, c, d, e) {
+  if (a && typeof a === 'object' && typeof a.message === 'string') {
+    return { level: a.level, message: a.message, line: a.lineNumber, sourceId: a.sourceId || '' };
+  }
+  return { level: b, message: c, line: d, sourceId: e || '' };
+}
+
+// ===== 全局异常兜底：避免单点崩溃让主进程整体退出 =====
+process.on('uncaughtException', (err) => {
+  dlog('error', 'uncaughtException', { message: err?.message, stack: err?.stack });
+});
+process.on('unhandledRejection', (reason) => {
+  dlog('error', 'unhandledRejection', { reason: reason?.message || String(reason) });
+});
+
+// ===== Chromium 启动开关（必须在 app ready 之前设置）=====
+// 与 stealth.cjs 的补丁配合：该开关保证即使将来附加 CDP debugger（路线 B），
+// navigator.webdriver 也不会被 Chromium 置为 true。
+// 实测：Electron 42.11.10（Chromium 148）未附加时 webdriver 已是 false，故本开关属预防性加固。
+// （审查 #115：原注释标注的 "Electron 31.7.7" 为升级前版本，已按当前依赖订正；升级后行为未变。）
+try {
+  app.commandLine.appendSwitch('disable-blink-features', 'AutomationControlled');
+} catch (e) { /* 受限环境可能不允许，忽略即可 */ }
+
+// ===== 统一 IPC 错误包装 =====
+function safeHandle(channel, handler) {
+  // ipcMain.handle 抛出会让渲染进程 invoke reject；这里统一捕获并结构化返回
+  // 保留 handler 自己的语义（返回 {ok, error, ...} 不会改；throw 会变成 reject）
+  ipcMain.handle(channel, async (event, ...args) => {
+    try {
+      return await handler(event, ...args);
+    } catch (err) {
+      dlog('error', `ipc handler failed: ${channel}`, { message: err?.message });
+      // 同步抛回，让渲染进程 invoke 的 promise 自然 reject（与未包装前一致）
+      throw err;
+    }
+  });
+}
+function safeOn(channel, handler) {
+  ipcMain.on(channel, async (event, ...args) => {
+    try {
+      await handler(event, ...args);
+    } catch (err) {
+      dlog('error', `ipc listener failed: ${channel}`, { message: err?.message });
+    }
+  });
+}
+
+// ===== AI Skills 层：skills/<id>/SKILL.md（标准技能格式） =====
+// 渲染层调用 AI 时按作用域启用技能：元数据（name/scope/defaultEnabled）经 jc:skills-list
+// 读取，指令正文经 jc:skills-read 读取后注入 system prompt。仅允许白名单目录，防路径穿越。
+// 内置技能（只读）位于 appPath/skills；自定义技能（用户导入/新建，可写）位于 userData/skills。
+const SKILLS_DIR = path.join(app.getAppPath(), 'skills');
+const CUSTOM_SKILLS_DIR = () => path.join(app.getPath('userData'), 'skills');
+const SKILL_ID_RE = /^[a-z0-9-]+$/;
+const SKILL_SCOPES = ['profile', 'job-analysis', 'greetings', 'assistant'];
+
+/** 解析 SKILL.md frontmatter（顶部成对分隔线之间的 key: value）+ 正文（frontmatter 之后的内容） */
+// 分隔线兼容 --- 与 *** / === / ___ 等常见 YAML/文档分隔符（历史文件曾用 ***/---------------------，
+// 统一按「整行仅由 3 个及以上同类分隔符组成」匹配，避免个别技能文件用非 --- 分隔导致解析失败、技能不显示）
+function parseSkillFile(raw) {
+  const delim = '[-*_=]';
+  const m = String(raw || '').match(new RegExp(`^${delim}{3,}\\s*\\n([\\s\\S]*?)\\n${delim}{3,}\\s*\\n?`));
+  if (!m) return null;
+  const meta = {};
+  for (const line of m[1].split('\n')) {
+    const idx = line.indexOf(':');
+    if (idx <= 0) continue;
+    const key = line.slice(0, idx).trim();
+    const value = line.slice(idx + 1).trim();
+    if (key) meta[key] = value;
+  }
+  return { meta, body: String(raw || '').slice(m[0].length).trim() };
+}
+
+/** 读取单个技能目录下的全部技能元数据（目录不存在返回 []） */
+async function readSkillDir(dir, custom) {
+  const out = [];
+  let entries = [];
+  try {
+    entries = await fs.promises.readdir(dir, { withFileTypes: true });
+  } catch {
+    return out; // skills 目录不存在时返回空（不报错）
+  }
+  for (const ent of entries) {
+    if (!ent.isDirectory() || !SKILL_ID_RE.test(ent.name)) continue;
+    try {
+      const raw = await fs.promises.readFile(path.join(dir, ent.name, 'SKILL.md'), 'utf8');
+      const parsed = parseSkillFile(raw);
+      if (!parsed) continue;
+      const scope = String(parsed.meta.scope || 'assistant');
+      out.push({
+        id: ent.name,
+        name: String(parsed.meta.title || parsed.meta.name || ent.name),
+        description: String(parsed.meta.description || ''),
+        scope: SKILL_SCOPES.includes(scope) ? scope : 'assistant',
+        defaultEnabled: String(parsed.meta.defaultEnabled) !== 'false',
+        custom: Boolean(custom),
+      });
+    } catch { /* 单个技能读取失败跳过 */ }
+  }
+  return out;
+}
+
+safeHandle('jc:skills-list', async () => {
+  const [builtin, custom] = await Promise.all([
+    readSkillDir(SKILLS_DIR, false),
+    readSkillDir(CUSTOM_SKILLS_DIR(), true),
+  ]);
+  return [...builtin, ...custom];
+});
+
+/** 读取技能正文：优先自定义目录（用户导入的会覆盖同 id 读取路径），再回退内置目录 */
+async function readSkillBody(id) {
+  for (const dir of [CUSTOM_SKILLS_DIR(), SKILLS_DIR]) {
+    try {
+      const raw = await fs.promises.readFile(path.join(dir, id, 'SKILL.md'), 'utf8');
+      const parsed = parseSkillFile(raw);
+      return { id, body: parsed ? parsed.body : raw };
+    } catch { /* 继续下一个目录 */ }
+  }
+  return { id, body: '' };
+}
+
+safeHandle('jc:skills-read', async (_event, id) => {
+  if (!SKILL_ID_RE.test(String(id || ''))) return { id: String(id || ''), body: '' };
+  return readSkillBody(String(id));
+});
+
+// ---- 自定义技能：导入（raw SKILL.md 全文 / fields 表单）与删除 ----
+
+/** 名称 → 目录 ID（小写字母数字连字符；纯中文等无 ASCII 名时回退 custom-<时间戳>） */
+function slugifyId(input) {
+  return String(input || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 48);
+}
+
+/** id 是否已存在（自定义目录或内置目录） */
+async function skillIdExists(id) {
+  if (!SKILL_ID_RE.test(id)) return true;
+  for (const dir of [CUSTOM_SKILLS_DIR(), SKILLS_DIR]) {
+    try {
+      await fs.promises.access(path.join(dir, id, 'SKILL.md'));
+      return true;
+    } catch { /* 继续 */ }
+  }
+  return false;
+}
+
+/** 生成不冲突的技能 ID（冲突时追加 -2/-3…） */
+async function uniqueSkillId(base) {
+  const clean = slugifyId(base) || `custom-${Date.now().toString(36)}`;
+  let id = clean;
+  let n = 1;
+  while (await skillIdExists(id)) {
+    id = `${clean}-${++n}`;
+    if (n > 100) return `custom-${Date.now().toString(36)}`; // 兜底防死循环
+  }
+  return id;
+}
+
+/** 写入自定义技能 SKILL.md（与内置格式一致：frontmatter + 正文） */
+async function writeCustomSkill({ id, name, description, scope, instructions }) {
+  const dir = path.join(CUSTOM_SKILLS_DIR(), id);
+  await fs.promises.mkdir(dir, { recursive: true });
+  const md = [
+    '---',
+    `name: ${id}`,
+    `title: ${name}`,
+    `description: ${description || ''}`,
+    `scope: ${scope}`,
+    'defaultEnabled: true',
+    '---',
+    '',
+    instructions.trim(),
+    '',
+  ].join('\n');
+  await fs.promises.writeFile(path.join(dir, 'SKILL.md'), md, 'utf8');
+}
+
+safeHandle('jc:skills-import', async (_event, payload) => {
+  const p = payload || {};
+  let name = '';
+  let description = '';
+  let scope = 'assistant';
+  let body = '';
+
+  if (typeof p.raw === 'string' && p.raw.trim()) {
+    // 方式一：导入 SKILL.md 全文（frontmatter + 正文）
+    const parsed = parseSkillFile(p.raw);
+    if (!parsed) {
+      return {
+        ok: false,
+        error: 'SKILL.md 格式错误：缺少 frontmatter 元信息块（文件需以 --- 开头，含 name/title、description、scope，正文为指令）。',
+      };
+    }
+    name = String(parsed.meta.title || parsed.meta.name || '').trim();
+    description = String(parsed.meta.description || '').trim();
+    scope = String(parsed.meta.scope || 'assistant').trim();
+    body = parsed.body;
+  } else if (p.fields && typeof p.fields === 'object') {
+    // 方式二：手动表单（设置页「新建技能」）
+    name = String(p.fields.name || '').trim();
+    description = String(p.fields.description || '').trim();
+    scope = String(p.fields.scope || 'assistant').trim();
+    body = String(p.fields.instructions || '').trim();
+  } else {
+    return { ok: false, error: '缺少导入内容：请提供 SKILL.md 全文（raw）或表单字段（fields）。' };
+  }
+
+  if (!name) return { ok: false, error: '技能名称不能为空（SKILL.md 需含 name 或 title）。' };
+  if (!body) return { ok: false, error: '技能指令正文不能为空。' };
+  if (!SKILL_SCOPES.includes(scope)) {
+    return { ok: false, error: `作用域非法：${scope}（可选：${SKILL_SCOPES.join(' / ')}）。` };
+  }
+
+  const id = await uniqueSkillId(name);
+  try {
+    await writeCustomSkill({ id, name, description, scope, instructions: body });
+  } catch (err) {
+    return { ok: false, error: '写入失败：' + (err?.message || String(err)) };
+  }
+  dlog('info', `custom skill imported: ${id} (scope=${scope})`);
+  return { ok: true, skill: { id, name, description, scope, defaultEnabled: true, custom: true } };
+});
+
+safeHandle('jc:skills-delete', async (_event, id) => {
+  const skillId = String(id || '');
+  if (!SKILL_ID_RE.test(skillId)) return { ok: false, error: '非法技能 ID。' };
+  // 内置目录存在同名 → 拒绝（只允许删除自定义技能）
+  try {
+    await fs.promises.access(path.join(SKILLS_DIR, skillId, 'SKILL.md'));
+    return { ok: false, error: '内置技能不可删除。' };
+  } catch { /* 内置不存在，继续 */ }
+  try {
+    await fs.promises.rm(path.join(CUSTOM_SKILLS_DIR(), skillId), { recursive: true, force: true });
+  } catch (err) {
+    return { ok: false, error: '删除失败：' + (err?.message || String(err)) };
+  }
+  dlog('info', `custom skill deleted: ${skillId}`);
+  return { ok: true };
+});
+
+// CloakBrowser 隐身浏览器（可选增强，默认关闭；用户在设置页切换）
+// 不动 webviewTag/原 webview 路径——webview 仍是默认引擎，CloakBrowser 作为并行通道。
+// 设计：AGENTS.md §2.1 末段（CloakBrowser 仅作可选增强，默认关闭，不得借此绕过验证码/账户验证）。
+const cloakLauncher = require('./cloakbrowser/launcher.cjs');
+
+const isDev = !app.isPackaged && process.argv.includes('--dev');
+const DEV_URL = 'http://localhost:5173';
+const APP_ID = 'com.bossclaw.desktop';
+
+// ===== 品牌更名：QiuShenClaw（二开版，原 BossClaw）=====
+// userData 目录沿用 Electron 默认规则 = %APPDATA%/<productName>。
+// 历史版本productName 为 BossClaw，登录态 cookie（persist:bossclaw 分区）与本地运行态文件
+// 都存在 %APPDATA%\BossClaw 下。改名为 QiuShenClaw 后若直接生效，Electron 会切到新空目录，
+// 用户所有平台登录态丢失。故在此做一次性迁移：旧目录存在且新目录不存在 → 整体重命名。
+// 注意：若旧实例仍在运行（Windows 下目录被锁），rename 会抛错——此时跳过迁移继续用新目录，
+// 用户退出旧实例后下次启动可再迁移（newExists 检查放行）。
+try {
+  const legacyUserData = path.join(app.getPath('appData'), 'BossClaw');
+  const currentUserData = path.join(app.getPath('appData'), 'QiuShenClaw');
+  const legacyExists = fs.existsSync(legacyUserData);
+  const currentExists = fs.existsSync(currentUserData);
+  if (legacyExists && !currentExists) {
+    fs.renameSync(legacyUserData, currentUserData);
+    console.log('[QiuShenClaw] userData migrated: %s -> %s', legacyUserData, currentUserData);
+  }
+} catch (e) {
+  // 迁移失败不阻断启动：最坏情况是登录态留在旧目录，重新扫码即可恢复。
+  console.warn('[QiuShenClaw] userData migration skipped:', (e && e.message) || e);
+}
+
+app.setName('QiuShenClaw');
+// 主窗口图标（nativeImage 加载 .ico，可同时作为大/小图标源：
+// Windows 任务栏缩略图/右键预览小窗取的是窗口 ICON_SMALL，仅设 exe 资源不足，需在此显式设置）。
+const APP_ICON_ICO = path.join(__dirname, '..', 'resources', 'icon.ico');
+const APP_ICON = nativeImage.createFromPath(APP_ICON_ICO);
+// Windows 任务栏按钮图标机制（重要）：
+// - 调用 setAppUserModelId 后，任务栏按钮图标改从「与该 AUMID 匹配的快捷方式(.lnk)」获取；
+//   打包安装版由 NSIS 注册了同 AUMID 的快捷方式 → 显示嵌入 exe 的项目图标（正常）。
+// - dev / 便携运行（electron.exe .）没有该快捷方式 → Explorer 回退显示 exe 图标
+//   （electron.exe = Electron 默认图标），BrowserWindow.icon 不生效 → 任务栏图标错误。
+// 故仅在打包（app.isPackaged）时设置 AUMID；非打包运行让任务栏跟随窗口图标
+// （resources/icon.ico），从而在 start-bossclaw.cmd 下也能显示项目图标。
+if (process.platform === 'win32' && app.isPackaged) {
+  app.setAppUserModelId(APP_ID);
+}
+
+
+// dev 模式下 Vite 可能因 5173 被占用而自动换端口（5174/5175…），
+// 若仍硬编码连 5173 会直接白屏。这里启动前扫描真实运行的 Vite 端口；
+// 最多轮询 5 次（约 3s）即放弃，由 createMainWindow 回退加载 dist/index.html，
+// 避免 Vite 未就绪时长时间空等（启动提速）。
+const DEV_PORTS = [5173, 5174, 5175, 5176, 5177, 5178, 5179];
+async function resolveDevUrl() {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    for (const port of DEV_PORTS) {
+      try {
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), 600);
+        const res = await fetch(`http://127.0.0.1:${port}/`, { signal: ctrl.signal });
+        clearTimeout(timer);
+        if (res.status < 400) return `http://localhost:${port}`;
+      } catch {}
+    }
+    if (attempt < 4) await new Promise((r) => setTimeout(r, 600));
+  }
+  return null;
+}
+
+// 最后一次构建产物入口：dev 服务器不可达时的兜底加载目标
+const DIST_INDEX = path.join(__dirname, '..', 'dist', 'index.html');
+
+let mainWindow = null;
+let bridgeProcess = null;
+// 本地控制桥句柄（BOSSCLAW_CONTROL=1 时才非空）
+let controlBridge = null;
+
+// Camoufox 隐身引擎：本地 Python 桥（camoufox_server.py），端口 18767
+let camoufoxProcess = null;
+const CAMOUFOX_PORT = 18767;
+// M-2：隐身后端桥令牌不再硬编码（原为常量 'bossclaw-camoufox'）。
+// 运行时随机生成并存于 ~/.bossclaw/camoufox-token（跨启动稳定，避免与上一会话残留的桥令牌不一致），
+// 经**环境变量**传给 Python（不再走 argv，避免出现在进程命令行里）。
+function loadOrCreateRuntimeSecret(name) {
+  const file = path.join(os.homedir(), '.bossclaw', name);
+  try {
+    const existing = fs.readFileSync(file, 'utf8').trim();
+    if (existing) return existing;
+  } catch { /* 不存在则生成 */ }
+  const generated = crypto.randomBytes(24).toString('hex');
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, generated, { mode: 0o600, flag: 'wx' });
+    return generated;
+  } catch {
+    try {
+      const existing = fs.readFileSync(file, 'utf8').trim();
+      if (existing) return existing;
+    } catch { /* 读回失败则退回本次生成 */ }
+    return generated;
+  }
+}
+const CAMOUFOX_TOKEN = loadOrCreateRuntimeSecret('camoufox-token');
+
+// ===== 数据版本标记：v3 重建后首次启动自动清空旧数据（BOSS 登录态 / 隐身引擎数据）=====
+// 本次「内置浏览器 + 收集投递沟通模块」从零重建，旧登录态与缓存需清空（用户需重新扫码登录）。
+// 通过 userData 下的标记文件保证只清一次，之后正常启动不再重复清理。
+const DATA_VERSION = 'v3-rebuild-20260815';
+async function resetDataForVersion() {
+  try {
+    const marker = path.join(app.getPath('userData'), '.bossclaw-data-version');
+    if (fs.existsSync(marker) && fs.readFileSync(marker, 'utf8').trim() === DATA_VERSION) return;
+    // 1) 清空 BOSS 登录态会话（persist:bossclaw 的 wt2 等 cookie）
+    //    **必须 await**：clearStorageData 是异步的，旧实现「发起即返回」会让它与 createMainWindow 并发——
+    //    用户在新装的 exe 首次启动后立刻在内置浏览器登录时，刚写入的 wt2 会被这次清理一并删掉，
+    //    表现为「明明登录了却一直显示未登录、采集被登录墙拦下」。下界保留兜底上限（不阻塞启动），
+    //    但**上限触发时必须记 warn**，否则「清理被提前放行」这一风险情形会被静默吞掉（见审查 #76）。
+    try {
+      let clearTimer = null;
+      const cleared = await Promise.race([
+        session.fromPartition('persist:bossclaw').clearStorageData().then(() => true),
+        new Promise((r) => { clearTimer = setTimeout(() => r(false), 15_000); }),
+      ]);
+      if (clearTimer) clearTimeout(clearTimer);
+      if (!cleared) {
+        dlog('warn', 'clear boss session storage exceeded 15s; proceeding without waiting');
+      }
+    } catch (e) { dlog('warn', 'clear boss session storage failed', { message: e?.message }); }
+    // 2) 清空 Camoufox 隐身引擎在 ~/.bossclaw 下的登录态与运行态文件。
+    //    原实现只删 `camoufox-cookies.json` 一个文件，漏掉：分平台 cookie（camoufox-cookies-{platform}.json）、
+    //    引擎探测态（engine-state.json）、采集断点（collection-progress.json）、本地桥数据（data.json）
+    //    —— v3「从零重建」后仍残留旧登录态/旧断点，会出现错误续跑或「虚假就绪」（见审查 #76）。
+    //    这里按白名单清理：cookie 一律按 `camoufox-cookies*.json` 通配（覆盖未来新增平台），
+    //    其余文件显式列举，避免误删用户放在同目录的其它文件。
+    try {
+      const camDir = path.join(app.getPath('home'), '.bossclaw');
+      if (fs.existsSync(camDir)) {
+        for (const f of fs.readdirSync(camDir)) {
+          if (/^camoufox-cookies.*\.json$/i.test(f)) {
+            try { fs.unlinkSync(path.join(camDir, f)); } catch {}
+          }
+        }
+        for (const f of ['engine-state.json', 'collection-progress.json', 'data.json']) {
+          try {
+            const p = path.join(camDir, f);
+            if (fs.existsSync(p)) fs.unlinkSync(p);
+          } catch {}
+        }
+      }
+    } catch (e) { dlog('warn', 'clear camoufox files failed', { message: e?.message }); }
+    // 3) 清空 CloakBrowser 隐身浏览器持久 profile
+    try {
+      const cloakProfile = path.join(app.getPath('userData'), 'cloakbrowser-profile');
+      if (fs.existsSync(cloakProfile)) fs.rmSync(cloakProfile, { recursive: true, force: true });
+    } catch (e) { dlog('warn', 'clear cloakbrowser profile failed', { message: e?.message }); }
+    // 4) 写版本标记，避免重复清理
+    try { fs.writeFileSync(marker, DATA_VERSION); } catch (e) { dlog('warn', 'write data-version marker failed', { message: e?.message }); }
+  } catch (e) { dlog('warn', 'reset data for version failed', { message: e?.message }); }
+}
+
+function startBridge() {
+  try {
+    const server = path.join(__dirname, '..', 'bridge', 'server.cjs');
+    // ELECTRON_RUN_AS_NODE=1：让 electron 二进制以纯 Node 模式运行桥接服务（mammoth/fs 等可用）
+    const child = spawn(process.execPath, [server], {
+      stdio: 'ignore',
+      detached: false,
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+    });
+    bridgeProcess = child;
+    child.on('error', (err) => dlog('warn', 'bridge process error', { message: err?.message }));
+    child.on('exit', (code, signal) => {
+      // 异常退出（kill/uncaught）记录；正常 stop 也走这里，避免悬挂指针
+      if (bridgeProcess === child) bridgeProcess = null;
+      if (signal || (typeof code === 'number' && code !== 0)) {
+        dlog('warn', 'bridge process exited', { code, signal });
+      }
+    });
+  } catch (err) {
+    // 桥接为可选模块，启动失败不影响主程序
+    dlog('warn', 'bridge spawn failed', { message: err?.message });
+  }
+}
+
+// ===== Camoufox 隐身引擎（Python 桥）=====
+
+// 项目本地 venv 的 python 可执行文件（install-deps.cmd 把 camoufox/playwright 装到这里）
+function venvPython() {
+  return process.platform === 'win32'
+    ? path.join(__dirname, '..', '.venv', 'Scripts', 'python.exe')
+    : path.join(__dirname, '..', '.venv', 'bin', 'python');
+}
+
+function detectPython() {
+  return new Promise((resolve) => {
+    // 1) 项目本地 venv 优先（stealth 依赖安装处），避免误用未装依赖的系统 Python
+    execFile(venvPython(), ['--version'], { timeout: 5000 }, (err) => {
+      if (!err) return resolve(venvPython());
+      // 2) 未创建 venv 时退回系统 Python
+      const candidates = process.platform === 'win32'
+        ? ['py', 'python', 'python3']
+        : ['python3', 'python'];
+      let idx = 0;
+      const tryNext = () => {
+        if (idx >= candidates.length) return resolve(null);
+        const cmd = candidates[idx++];
+        execFile(cmd, ['--version'], { timeout: 5000 }, (e2) => {
+          if (e2) return tryNext();
+          resolve(cmd);
+        });
+      };
+      tryNext();
+    });
+  });
+}
+
+// 执行 python 命令并返回 Promise（stderr 视为失败）
+function runPythonAsync(python, args, opts = {}) {
+  return new Promise((resolve, reject) => {
+    execFile(python, args, { timeout: opts.timeout || 120000, ...opts }, (err, stdout, stderr) => {
+      if (err) {
+        const msg = String(stderr || err.message || '');
+        return reject(new Error(msg.trim() || `命令失败：${args[0] || ''}`));
+      }
+      resolve(String(stdout || '').trim());
+    });
+  });
+}
+
+// ===== 隐身引擎 Python 依赖自愈（后台安装，不阻塞请求）=====
+// 背景：桥的 Chrome/Edge 回退路径运行时 `from playwright.sync_api import ...`，
+// 若所选 Python 未装 playwright 会抛 `No module named 'playwright'`。
+// 注意：首次安装不能阻塞在 IPC 请求里（否则前端按钮无限转圈），改为后台跑，请求立刻返回「安装中」。
+let _cfxDepsReady = null;       // 本次会话已就绪的 python 路径
+let _cfxDepsInstalling = null;  // 后台安装 Promise（去重）
+
+// ===== 引擎检测状态持久化：内核/依赖检测过一次即跨启动保留，避免每次开软件重做 =====
+// app.getPath 须在 ready 后调用，故惰性计算路径
+function comfoxStateFile() {
+  return path.join(app.getPath('home'), '.bossclaw', 'engine-state.json');
+}
+function loadEngineState() {
+  try {
+    const f = comfoxStateFile();
+    if (fs.existsSync(f)) return JSON.parse(fs.readFileSync(f, 'utf-8'));
+  } catch (e) { dlog('warn', 'load engine-state failed', { message: e?.message }); }
+  return {};
+}
+function saveEngineState(patch) {
+  try {
+    const merged = { ...loadEngineState(), ...patch };
+    const f = comfoxStateFile();
+    fs.mkdirSync(path.dirname(f), { recursive: true });
+    fs.writeFileSync(f, JSON.stringify(merged));
+  } catch (e) { dlog('warn', 'save engine-state failed', { message: e?.message }); }
+}
+function markCamoufoxReady(python) {
+  _cfxDepsReady = python;
+  saveEngineState({ python, depsReady: true });
+}
+
+// 探测指定 python 缺失哪些 stealth 依赖（快，不触发安装）
+function probeMissingDeps(python) {
+  return new Promise((resolve) => {
+    execFile(python, ['-c',
+      "import importlib.util;ps=['playwright','camoufox'];print(','.join(p for p in ps if importlib.util.find_spec(p) is None))"],
+      { timeout: 10000 }, (err, stdout) => {
+        if (err) return resolve(['playwright', 'camoufox']);
+        // 空输出（无缺失）时 stdout 为换行符，必须 trim 后再过滤，否则误判 missing=["\r\n"]
+        resolve(String(stdout || '').split(',').map((s) => s.trim()).filter(Boolean));
+      });
+  });
+}
+
+// 后台真正安装依赖：优先装进程 playwright（Chromium 回退必需、体积小、快）；
+// camoufox 为可选增强（native 内核才需要），尽力安装，失败静默不阻塞。
+async function installCamoufoxDeps(python) {
+  // 决定安装目标：项目 .venv（干净、可复现）→ 否则退回所选 Python
+  let target = python;
+  const venv = venvPython();
+  if (python !== venv) {
+    try {
+      if (!fs.existsSync(venv)) {
+        await runPythonAsync(python, ['-m', 'venv', path.join(__dirname, '..', '.venv')], { timeout: 120000 });
+      }
+      if (fs.existsSync(venv)) target = venv;
+    } catch (e) {
+      dlog('warn', 'create stealth venv failed, fallback to system python', { message: e?.message });
+      target = python;
+    }
+  }
+  const pip = (pkg, idx) => runPythonAsync(target, ['-m', 'pip', 'install', '-q', '--upgrade', pkg], { timeout: 300000 })
+    .catch(async (e) => {
+      if (idx < 2) {
+        dlog('warn', `pip install ${pkg} retry with mirror`, { message: e?.message });
+        return runPythonAsync(target, ['-m', 'pip', 'install', '-q', '--upgrade', pkg,
+          '-i', 'https://pypi.tuna.tsinghua.edu.cn/simple'], { timeout: 360000 });
+      }
+      throw e;
+    });
+  // 1) 核心：playwright（必须装好，否则回退/原生内核 import camoufox 都会失败并抛 No module named 'playwright'）
+  //    camoufox 0.5.x 要求 playwright<1.61，须锁定兼容版本
+  try { await pip('playwright>=1.40,<1.61', 1); } catch (e) { dlog('error', 'playwright install failed', { message: e?.message }); throw e; }
+  // 2) 可选：camoufox[geoip]（原生内核 + GeoIP，优先用于登录/沟通；失败不影响 Chromium 回退）
+  try { await pip('camoufox[geoip]', 0); } catch (e) { dlog('info', 'camoufox install skipped (optional)', { message: e?.message }); }
+  dlog('info', 'stealth deps ready', { target });
+  return target;
+}
+
+// 确保依赖就绪：已就绪立即返回；缺失则触发后台安装并返回「安装中」。
+async function ensureCamoufoxDeps(python) {
+  if (_cfxDepsReady) return { python: _cfxDepsReady, ok: true, ready: true };
+  let missing = [];
+  try { missing = await probeMissingDeps(python); } catch (e) { missing = ['playwright', 'camoufox']; }
+  if (!missing.length) {
+    markCamoufoxReady(python);
+    return { python, ok: true, ready: true };
+  }
+  // 开始后台安装（去重）
+  if (!_cfxDepsInstalling) {
+    _cfxDepsInstalling = installCamoufoxDeps(python)
+      .then((target) => { markCamoufoxReady(target); _cfxDepsInstalling = null; return target; })
+      .catch((e) => { dlog('error', 'install stealth deps failed', { message: e?.message }); _cfxDepsInstalling = null; return null; });
+  }
+  return {
+    python, ok: false, ready: false, installing: true,
+    message: '正在安装隐身引擎依赖（首次约需 1-2 分钟），请稍候后点击「检测状态」重试',
+  };
+}
+
+// 检测隐身引擎可用性：仅 camouflage 隐身引擎（原生内核）可用。
+// 实测 BOSS 会对 Playwright 驱动的系统 Chrome/Edge 返回空壳页，本地浏览器不可复用，
+// 因此只有「Camoufox 包 + 原生内核」可用。
+function checkCamoufoxEngine(pythonCmd) {
+  return new Promise((resolve) => {
+    if (!pythonCmd) return resolve(false);
+    const probe = "import importlib.util;print(1 if importlib.util.find_spec('camoufox') is not None else 0)";
+    execFile(pythonCmd, ['-c', probe], { timeout: 8000 }, (err, stdout) => {
+      resolve(!err && String(stdout || '').trim() === '1');
+    });
+  });
+}
+
+// 启动隐身引擎 Python 桥（按需：Python + camoufox 包可用即启动）
+// pythonOverride 调用方已确保依赖就绪时传入，避免重复探测；未传时自愈依赖（后台安装）。
+async function startCamoufoxBridge(pythonOverride) {
+  if (camoufoxProcess) return { running: true };
+  let python = pythonOverride || (await detectPython());
+  if (!python) return { running: false, error: '未检测到 Python 环境' };
+  if (!pythonOverride) {
+    const env = await ensureCamoufoxDeps(python);
+    if (env.installing) return { running: false, installing: true, error: env.message || '隐身引擎依赖安装中，请稍候再试' };
+    python = env.python || python;
+  }
+  const available = await checkCamoufoxEngine(python);
+  if (!available) return { running: false, error: '隐身引擎未就绪：Camoufox 内核文件缺失。请运行离线安装：python install_offline.py（本机已缓存内核 zip，无需联网；不要用 camoufox fetch，它会先清空目录再联网下载）' };
+  try {
+    const server = path.join(__dirname, '..', 'camoufox', 'camoufox_server.py');
+    // 防御性清理：若环境注入了 safe-delete shim（如部分沙箱/运行时），Python 的 shutil.rmtree
+    // 会被拦截导致 camoufox fetch 等清理逻辑失败；spawn 时剥离该注入，不影响正常用户环境。
+    const env = { ...process.env, BOSSCLAW_CAMOUFOX_TOKEN: CAMOUFOX_TOKEN };
+    if (String(env.PYTHONPATH || '').includes('vendor/shim')) delete env.PYTHONPATH;
+    camoufoxProcess = spawn(python, [server, '--port', String(CAMOUFOX_PORT)], {
+      stdio: 'ignore',
+      detached: false,
+      windowsHide: true,
+      env,
+    });
+    camoufoxProcess.on('error', (err) => dlog('warn', 'camoufox process error', { message: err?.message }));
+    camoufoxProcess.on('exit', (code, signal) => {
+      camoufoxProcess = null;
+      if (signal || (typeof code === 'number' && code !== 0)) {
+        dlog('warn', 'camoufox process exited', { code, signal });
+      }
+    });
+    // 等待端口就绪（最多 6s）
+    await new Promise((resolve) => {
+      const deadline = Date.now() + 6000;
+      const probe = async () => {
+        try {
+          const res = await fetch(`http://127.0.0.1:${CAMOUFOX_PORT}/status?token=${CAMOUFOX_TOKEN}`, { signal: AbortSignal.timeout(1200) });
+          if (res.ok) return resolve(true);
+        } catch {}
+        if (Date.now() > deadline) return resolve(false);
+        setTimeout(probe, 400);
+      };
+      probe();
+    });
+    return { running: true };
+  } catch (e) {
+    return { running: false, error: String((e && e.message) || e) };
+  }
+}
+
+function stopCamoufoxBridge() {
+  if (camoufoxProcess) {
+    try { camoufoxProcess.kill(); } catch {}
+    camoufoxProcess = null;
+  }
+}
+
+// 后台预热：应用启动时加载持久化的「已就绪」状态并预拉起 Python 桥，
+// 让登录/自动沟通首次点击不再承担冷启动（import camoufox/numpy 等较重）与重复检测。
+// 性能口径：仅当「跨启动校验通过、依赖确实就绪」时才预拉 Python 进程（常驻内存 ~200-400MB）。
+// 依赖缺失/损坏（state 过期）时不再无条件 spawn——否则每次启动都会白跑一个 python 进程，
+// 造成启动后 CPU/内存占用升高；缺失场景交给首次使用时 ensureCamoufoxDeps 自愈。
+function warmUpCamoufox() {
+  (async () => {
+    const python = await detectPython();
+    if (!python) return;
+    // 跨启动继承上次检测结果：python 一致且曾就绪 → 视为就绪，跳过重复探测。
+    // 但需用一次廉价探测校验依赖仍在（避免 playwright/camoufox 被卸载或残留损坏目录后，
+    // 持久化「已就绪」掩盖问题；探测缺失则交给 ensure 后台自愈重装）。
+    const state = loadEngineState();
+    let ready = false;
+    if (state.python === python && state.depsReady) {
+      let missing = [];
+      try { missing = await probeMissingDeps(python); } catch { missing = ['playwright', 'camoufox']; }
+      if (!missing.length) {
+        markCamoufoxReady(python);
+        ready = true;
+        dlog('info', 'camoufox engine state restored', { python });
+      } else {
+        dlog('warn', 'camoufox engine state stale, will re-probe/install', { python, missing });
+      }
+    }
+    if (!ready) return; // 依赖不可用：不预拉进程，等待首次使用时按需拉起
+    await startCamoufoxBridge();
+  })().catch((e) => dlog('warn', 'camoufox warm-up failed', { message: e?.message }));
+}
+
+// 渲染层查询 Camoufox 引擎状态（Python 探测 + camoufox 包检测 + 桥运行状态）
+// platform 参数（boss/liepin/zhaopin/job51）：/status 返回对应平台登录态
+safeHandle('jc:camoufox-status', async (_event, platform) => {
+  const pf = String(platform || 'boss');
+  const python = await detectPython();
+  if (!python) return { python: false, running: false, ready: false, message: '未检测到 Python 环境' };
+  // 自愈依赖后再判定可用性，避免「检测到内核但缺 playwright 运行时崩溃」
+  const env = await ensureCamoufoxDeps(python);
+  if (env.installing) {
+    return { python: true, pythonCmd: python, camoufox: false, running: false, ready: false, installing: true, message: env.message || '正在安装隐身引擎依赖，请稍候' };
+  }
+  const readyPython = env.python || python;
+  const available = await checkCamoufoxEngine(readyPython);
+  const base = { python: Boolean(readyPython), pythonCmd: readyPython, camoufox: available };
+  if (!available) {
+    return { ...base, running: false, ready: false, message: '隐身引擎未就绪（暂未下载 Camoufox 内核，请安装 Camoufox 隐身引擎内核）' };
+  }
+  // 桥未运行则尝试拉起
+  if (!camoufoxProcess) {
+    const r = await startCamoufoxBridge(readyPython);
+    if (!r.running) return { ...base, running: false, ready: false, message: r.error || '桥启动失败' };
+  }
+  try {
+    const res = await fetch(`http://127.0.0.1:${CAMOUFOX_PORT}/status?token=${CAMOUFOX_TOKEN}&platform=${encodeURIComponent(pf)}`, { signal: AbortSignal.timeout(3000) });
+    const data = await res.json();
+    return { ...base, running: true, ready: Boolean(data.ok), message: data.message || '', engine: data };
+  } catch (e) {
+    return { ...base, running: true, ready: false, message: String((e && e.message) || e) };
+  }
+});
+
+// 显式停止隐身引擎桥（设置页用）
+ipcMain.on('jc:camoufox-stop', () => stopCamoufoxBridge());
+
+// 重启隐身引擎桥：先停后拉，返回最终状态（自动沟通误触关闭后自愈用；
+// 多次重启失败由渲染层判定并自动停止自动沟通）
+safeHandle('jc:camoufox-restart', async (_event, platform) => {
+  const pf = String(platform || 'boss');
+  stopCamoufoxBridge();
+  const python = await detectPython();
+  if (!python) return { python: false, running: false, ready: false, message: '未检测到 Python 环境' };
+  const env = await ensureCamoufoxDeps(python);
+  if (env.installing) {
+    return { python: true, running: false, ready: false, installing: true, message: env.message || '正在安装隐身引擎依赖，请稍候' };
+  }
+  const readyPython = env.python || python;
+  const available = await checkCamoufoxEngine(readyPython);
+  if (!available) {
+    return { python: Boolean(readyPython), camoufox: false, running: false, ready: false, message: '隐身引擎未就绪（仅支持 Camoufox 隐身引擎内核，本地浏览器不可复用）' };
+  }
+  const r = await startCamoufoxBridge(readyPython);
+  if (!r.running) {
+    return { python: Boolean(readyPython), camoufox: true, running: false, ready: false, message: r.error || '桥重启失败' };
+  }
+  try {
+    const res = await fetch(`http://127.0.0.1:${CAMOUFOX_PORT}/status?token=${CAMOUFOX_TOKEN}&platform=${encodeURIComponent(pf)}`, { signal: AbortSignal.timeout(3000) });
+    const data = await res.json();
+    return { python: Boolean(readyPython), camoufox: true, running: true, ready: Boolean(data.ok), message: data.message || '', engine: data };
+  } catch (e) {
+    return { python: Boolean(readyPython), camoufox: true, running: true, ready: false, message: String((e && e.message) || e) };
+  }
+});
+
+// 渲染层调用隐身引擎桥（search/send/login），统一转发 127.0.0.1 请求
+safeHandle('jc:camoufox-call', async (_event, action, payload) => {
+  const python = await detectPython();
+  if (!python) return { ok: false, error: '未检测到 Python 环境' };
+  const env = await ensureCamoufoxDeps(python);
+  if (env.installing) return { ok: false, installing: true, error: env.message || '隐身引擎依赖安装中，请稍候再试' };
+  const readyPython = env.python || python;
+  const available = await checkCamoufoxEngine(readyPython);
+  if (!available) return { ok: false, error: '隐身引擎未就绪（本地浏览器不可复用，请安装 Camoufox 隐身引擎内核）' };
+  if (!camoufoxProcess) {
+    const r = await startCamoufoxBridge(readyPython);
+    if (!r.running) return { ok: false, error: r.error || '桥启动失败' };
+  }
+  const pathMap = { search: '/search', send: '/send', chat: '/chat', chatWatch: '/chat-watch', login: '/login', logout: '/logout', clear: '/clear', platforms: '/platforms', progress: '/collection-progress' };
+  const apiPath = pathMap[action];
+  if (!apiPath) return { ok: false, error: `unknown action: ${action}` };
+  try {
+    const res = await fetch(`http://127.0.0.1:${CAMOUFOX_PORT}${apiPath}?token=${CAMOUFOX_TOKEN}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload || {}),
+      signal: AbortSignal.timeout((action === 'login' ? 360 : 240) * 1000),
+    });
+    return await res.json();
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e) };
+  }
+});
+
+async function createMainWindow() {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.show();
+    mainWindow.focus();
+    return mainWindow;
+  }
+
+  mainWindow = new BrowserWindow({
+    width: 1440,
+    height: 900,
+    minWidth: 960,
+    minHeight: 680,
+    title: 'QiuShenClaw',
+    icon: APP_ICON,
+    backgroundColor: '#f6f7f9',
+    show: false,
+    autoHideMenuBar: true,
+    // frame: false — 完全自定义标题栏（含窗口控制按钮），由渲染进程 TitleBar 组件绘制
+    frame: false,
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      // sandbox:false 让 preload 能 require('node:path') 等 Node 内置模块；
+      // 否则 preload 崩溃，window.electron 不暴露，所有 IPC（含窗口控制按钮）失效。
+      // contextIsolation 仍为 true、nodeIntegration 仍为 false，渲染进程安全边界不变。
+      sandbox: false,
+      webviewTag: true,
+      preload: path.join(__dirname, 'preload', 'app.cjs'),
+      spellcheck: false,
+      // 关闭后台节流：最小化时渲染进程定时器仍按时触发（本地 5 分钟备份心跳 / 定时任务后台触发依赖此设置）
+      backgroundThrottling: false,
+    },
+  });
+
+  // 加载失败兜底（见审查 #87）：`loadURL` / `loadFile` 在失败时返回 reject 的 Promise；
+  // 不 catch 会落到全局 unhandledRejection（只记日志），窗口停在白屏且没有任何解释。
+  // 这里 catch 后换成一句可读的提示页，并把失败原因带上，便于定位（Vite 退出 / dist 缺失等）。
+  const loadWithFallback = (p, label) => {
+    Promise.resolve(p).catch((e) => {
+      const msg = String((e && e.message) || e || '未知错误');
+      dlog('error', 'main window load failed', { label, message: msg });
+      try {
+        mainWindow.loadURL(
+          'data:text/html;charset=utf-8,' +
+            encodeURIComponent(
+              '<html><body style="font-family:sans-serif;padding:40px"><h2>QiuShenClaw 界面加载失败</h2>' +
+                '<p>' + msg.replace(/[<>&"]/g, '') + '</p>' +
+                '<p>请重启应用；若持续出现，请在 desktop-app 目录执行 <code>npm run build</code> 后重试。</p></body></html>'
+            )
+        );
+      } catch { /* 兜底页再失败则保持现状 */ }
+    });
+  };
+
+  if (isDev) {
+    const url = await resolveDevUrl();
+    if (url) {
+      loadWithFallback(mainWindow.loadURL(url), 'dev-url');
+    } else if (fs.existsSync(DIST_INDEX)) {
+      // Vite 未就绪：回退加载最后一次构建产物，避免白屏
+      loadWithFallback(mainWindow.loadFile(DIST_INDEX), 'dev-fallback-dist');
+    } else {
+      // 既无 dev 服务器也无构建产物：给出一句可读的提示，而非白屏
+      loadWithFallback(
+        mainWindow.loadURL(
+          'data:text/html;charset=utf-8,' +
+            encodeURIComponent(
+              '<html><body style="font-family:sans-serif;padding:40px"><h2>QiuShenClaw 启动失败</h2>' +
+                '<p>开发服务器未启动，且未找到构建产物 <code>dist/index.html</code>。</p>' +
+                '<p>请在 desktop-app 目录执行 <code>npm run build</code> 或 <code>npm run dev</code> 后重试。</p></body></html>'
+            )
+        ),
+        'dev-no-build'
+      );
+    }
+  } else {
+    loadWithFallback(mainWindow.loadFile(DIST_INDEX), 'prod-dist');
+  }
+
+  // === 白屏诊断日志（与 dlog 同一开关：BOSSCLAW_DEBUG=1 或未打包版；写入 debug-render.log）===
+  // 审查 #12 同源修正：原判据只认 `BOSSCLAW_DEBUG === '1'`，而 dlog / webviewDiag 用 isDebugEnabled()
+  // （`BOSSCLAW_DEBUG=1` **或** `!app.isPackaged`）→ 未打包开发版「主日志开、渲染诊断关」，
+  // 排查白屏时恰好缺最关键的一份日志。统一到 isDebugEnabled()。仍需硬关时置 BOSSCLAW_DEBUG=0。
+  if (isDebugEnabled()) {
+    try {
+      let diagPath;
+      try { diagPath = path.join(app.getPath('userData'), 'debug-render.log'); }
+      catch { diagPath = path.join(__dirname, '..', 'debug-render.log'); }
+      const diagLog = (m) => { try { fs.appendFileSync(diagPath, `[${new Date().toISOString()}] ${m}\n`); } catch {} };
+      diagLog('createMainWindow: isDev=' + isDev + ' target=' + (isDev ? '(dev url resolved)' : 'dist/index.html'));
+      mainWindow.webContents.on('console-message', (...args) => { const m = parseConsoleMessage(...args); diagLog('CONSOLE level=' + m.level + ' msg=' + m.message + ' @' + (m.sourceId || '') + ':' + m.line); });
+      mainWindow.webContents.on('did-fail-load', (ev, errorCode, errorDescription, validatedURL) => { diagLog('FAIL-LOAD code=' + errorCode + ' desc=' + errorDescription + ' url=' + validatedURL); });
+      mainWindow.webContents.on('crashed', () => diagLog('WEBVIEW CRASHED'));
+      mainWindow.webContents.on('did-finish-load', () => {
+        diagLog('did-finish-load fired');
+        setTimeout(async () => {
+          try {
+            const info = await mainWindow.webContents.executeJavaScript('(function(){var r=document.getElementById("root");return JSON.stringify({rootLen:r?r.innerHTML.length:-1,hasAppShell:!!document.querySelector(".app-shell,.ant-app"),bodyText:(document.body?document.body.innerText||"":"").slice(0,200),title:document.title});})()');
+            diagLog('DOM-CHECK ' + info);
+          } catch (e) { diagLog('DOM-CHECK ERROR ' + (e && e.message)); }
+        }, 2500);
+        // 诊断：切到工作台看内置浏览器 webview 加载情况
+        setTimeout(async () => {
+          try {
+            await mainWindow.webContents.executeJavaScript('(function(){var btns=[].slice.call(document.querySelectorAll(".nav-btn"));var b=btns.find(function(x){return (x.innerText||"").indexOf("工作台")>=0;});if(b){b.click();return "clicked-workbench";}return "no-workbench-btn";})()');
+          } catch (e) { diagLog('SWITCH ERROR ' + (e && e.message)); }
+        }, 4000);
+        setTimeout(async () => {
+          try {
+            const st = await mainWindow.webContents.executeJavaScript('(function(){var input=document.querySelector(".browser-bar input");var wv=document.querySelector("webview");return JSON.stringify({addrValue:input?input.value:null,addrPlaceholder:input?input.getAttribute("placeholder"):null,hasWebview:!!wv,webviewSrc:wv?wv.getAttribute("src"):null,webviewUrl:wv?wv.getURL?wv.getURL():"n/a":"n/a",barHTML:document.querySelector(".browser-bar")?document.querySelector(".browser-bar").innerText.slice(0,120):null});})()');
+            diagLog('BROWSER-STATE ' + st);
+          } catch (e) { diagLog('BROWSER-STATE ERROR ' + (e && e.message)); }
+        }, 10000);
+      });
+      // ===== 临时诊断：webview 加载时序（定位「内置浏览器不显示 BOSS 链接」）=====
+      mainWindow.webContents.on('did-attach-webview', (_e, wc) => {
+        const tag = wc.getURL?.() || '';
+        diagLog('WEBVIEW-ATTACHED url=' + tag);
+        // 主框架过滤（对齐渲染层 BrowserView.tsx 口径）：iframe 子框架导航（广告/内嵌卡片）不写诊断日志
+        wc.on('did-start-navigation', (ev, url, _isInPlace, legacyIsMainFrame) => {
+          const isMainFrame = typeof ev?.isMainFrame === 'boolean' ? ev.isMainFrame : legacyIsMainFrame !== false;
+          if (!isMainFrame) return;
+          diagLog('WEBVIEW did-start-navigation url=' + url);
+        });
+        wc.on('did-navigate', (_ev, url) => diagLog('WEBVIEW did-navigate url=' + url));
+        wc.on('did-fail-load', (_ev, code, desc, url) => diagLog('WEBVIEW did-fail-load code=' + code + ' desc=' + desc + ' url=' + url));
+        wc.on('did-finish-load', () => diagLog('WEBVIEW did-finish-load url=' + (wc.getURL?.() || '')));
+        wc.on('dom-ready', () => diagLog('WEBVIEW dom-ready url=' + (wc.getURL?.() || '')));
+      });
+    } catch {}
+  }
+
+  // ===== 内置浏览器右键菜单（常驻注册）=====
+  // webview 默认无右键菜单；补齐常规项（后退/前进/刷新/复制/粘贴/全选）+
+  // 链接操作（新标签打开/复制链接）+ 查看网页源码（本页 Modal 展示，不跳新标签页）。
+  // 后退/前进走 preload 的 SPA 历史栈（spa-back/spa-forward），整页导航与 SPA 内跳转都生效。
+  mainWindow.webContents.on('did-attach-webview', (_e, wc) => {
+    wc.on('context-menu', (_ev, params) => {
+      const template = [
+        { label: '后退', click: () => { try { wc.send('spa-back'); } catch {} } },
+        { label: '前进', click: () => { try { wc.send('spa-forward'); } catch {} } },
+        { label: '刷新', click: () => { try { wc.reload(); } catch {} } },
+        { label: '停止加载', click: () => { try { wc.stop(); } catch {} } },
+        { type: 'separator' },
+        { label: '复制', enabled: Boolean(params.selectionText), click: () => clipboard.writeText(params.selectionText || '') },
+        { label: '粘贴', enabled: Boolean(params.isEditable), click: () => { try { wc.paste(); } catch {} } },
+        { label: '全选', click: () => { try { wc.selectAll(); } catch {} } },
+      ];
+      if (params.linkURL) {
+        template.push(
+          { type: 'separator' },
+          { label: '在新标签打开链接', click: () => mainWindow?.webContents.send('jc:webview-open-link', { url: params.linkURL }) },
+          { label: '复制链接地址', click: () => clipboard.writeText(params.linkURL) },
+        );
+      }
+      // 查看网页源码：主进程取 outerHTML 经 IPC 回传渲染进程，在本页 Modal 展示
+      // （不用 wc.viewSource() —— 它会导航 webview 到 view-source: 新页面，体验割裂）。
+      template.push(
+        { type: 'separator' },
+        { label: '查看网页源码', click: () => {
+          try {
+            wc.executeJavaScript('document.documentElement.outerHTML').then((html) => {
+              mainWindow?.webContents.send('jc:webview-source', { url: wc.getURL?.() || '', html: String(html || '') });
+            }).catch((e) => {
+              mainWindow?.webContents.send('jc:webview-source', { url: wc.getURL?.() || '', html: '', error: String((e && e.message) || e) });
+            });
+          } catch {}
+        } },
+      );
+      try { Menu.buildFromTemplate(template).popup({ window: mainWindow }); } catch {}
+    });
+  });
+
+  // ===== 智联岗位卡「真实详情 URL」注解 + master-detail 点卡整页跳转 =====
+  // 智联新版 PC 搜索页是「左列表 .job-card + 右侧 .job-detail-panel 内联详情」。
+  // 岗位卡存在无 jobdetail 锚点的渲染变体（标题为 span.vue-clamp__text 而非 <a>），
+  // 列表级采集拿不到每卡 URL，会全部折叠成同一链接、去重后只剩 1 个岗位，且队列
+  // 里的链接指向搜索页而非岗位详情。
+  // 官方 SSR `__INITIAL_STATE__` 中每个岗位含详情 URL 所需字段 —— 注意字段名两版并存：
+  //   新版 positionList 顶层：name / number / positionUrl（如
+  //     {"name":"…","positionName"…,"number":"CCL…J…","positionUrl":"http://www.zhaopin.com/jobdetail/…"}）
+  //   旧版：positionName / positionNumber
+  // 旧脚本只认 old 字段 → 新版下 positionList 被整个跳过、注解 100% 不生效
+  // （实测「列表就绪 6 卡却只入 1」「队列链接是搜索页 URL」即源于此）。
+  // 此脚本注入**主世界**（preload 在隔离世界，读不到 __INITIAL_STATE__）：
+  //   1. 按两版字段名建索引，用「岗位名+公司名」精确匹配把详情 URL 标注成
+  //      data-bossclaw-jobdetail（preload 读取兜底，MutationObserver 覆盖懒加载新卡）；
+  //   2. 新鲜度闸门：智联在交互/客户端刷新后 __INITIAL_STATE__ 会与当前卡片不同步
+  //      （实测 20 卡 20 岗内容完全两套），此时索引/selectedJobId 均不可信，绝不盲标。
+  //      以「激活卡标题 === selectedJobId 岗位名」判定新鲜，仅新鲜时才启用
+  //      激活卡锚定与顺序对齐两个盲标兜底，否则只做逐卡文本精确匹配，未命中的
+  //      岗位留空 URL（preload 用文本 key 去重；这类卡也拿不到岗位号 → 列表级采集的
+  //      详情 JD 补齐（webview.cjs::enrichJobDetail，按 number 查详情）同样跳过，
+  //      按卡片文本入库，不丢岗位）；
+  //   3. click 捕获：用户点岗位卡 → 命中索引 → preventDefault + 整页导航到独立详情页
+  //      （当前标签跳转、可后退回列表）；匹配不到不做接管，退回站点原生内联。
+  const ZP_DETAIL_NAV_SCRIPT = `(function () {
+    if (window.__bossclawZpNavDone) return; window.__bossclawZpNavDone = true;
+    var inc = window.__INITIAL_STATE__;
+    if (!inc) return;
+    // 不再因「此刻还没有 .job-card」就整体退出：应用自身搜索 URL 是 /sou/（服务端渲染的
+    // 旧版 .joblist-box__item 列表，带 jobdetail 锚点），而智联客户端随后可能把它换成新版
+    // 拆分布局（.job-card，卡片无锚点）——若在 did-finish-load 时就退出，换版后新出现的
+    // .job-card 永远拿不到岗位号/详情 URL，后续「列表级采集」的 JD 补齐也随之中断
+    // （没有 number 就查不到详情）。保持脚本存活由后续 MutationObserver 覆盖换版 / 懒加载。
+    var norm = function (s) { return String(s == null ? '' : s).replace(/\\s+/g, ' ').trim(); };
+    // ===== 岗位索引（兼容新版 name/number 与旧版 positionName/positionNumber）=====
+    var jobs = [];
+    var byJobId = {};
+    var collectArray = function (arr) {
+      if (!Array.isArray(arr)) return;
+      for (var i = 0; i < arr.length; i++) {
+        var o = arr[i];
+        if (!o || typeof o !== 'object') continue;
+        var name = norm(o.positionName) || norm(o.name);
+        var pn = norm(o.positionNumber) || norm(o.number);
+        if (!name || !pn) continue;
+        var jobId = String(o.jobId != null ? o.jobId : pn);
+        jobs.push({ name: name, company: norm(o.companyName), pn: pn, jobId: jobId });
+        if (jobId && !byJobId[jobId]) byJobId[jobId] = jobs[jobs.length - 1];
+      }
+    };
+    collectArray(inc.positionList);
+    if (!jobs.length) {
+      Object.keys(inc).forEach(function (k) {
+        var v = inc[k];
+        if (Array.isArray(v) && v.length && v[0] && (v[0].positionName || v[0].name) && (v[0].positionNumber || v[0].number)) collectArray(v);
+      });
+    }
+    if (!jobs.length && !document.querySelector('.job-card') && !document.querySelector('[class*="joblist-box"]')) return;
+    // 注：SSR 无岗位索引但页面有列表 DOM 时**继续安装**（下方列表接口旁路监听会把滚动加载出来的
+    // 岗位并入索引）；两者都没有 = 与岗位列表无关的智联页面（首页 / 公司页等）→ 不注入任何钩子。
+    var detailBase = 'https://www.zhaopin.com/jobdetail/';
+    // ===== 新鲜度闸门：激活卡（页面 boot 选中）标题与 selectedJobId 岗位名一致才算「索引可信」=====
+    // 智联客户端刷新 / 交互后 __INITIAL_STATE__ 可能与当前卡片不同步（实测 20 卡 20 岗两套数据），
+    // 此时顺序对齐 / 激活卡锚定都会错标 -> 必须关掉盲标兜底，只留逐卡文本精确匹配。
+    var fresh = false;
+    var selJob = (inc.selectedJobId && byJobId[String(inc.selectedJobId)]) ? byJobId[String(inc.selectedJobId)] : null;
+    var activeEl = document.querySelector('.job-card--active .vue-clamp__text');
+    if (selJob && activeEl) {
+      var activeName = norm(activeEl.getAttribute('aria-label') || activeEl.textContent);
+      fresh = Boolean(activeName && selJob.name === activeName);
+    }
+    var pick = function (name, comp) {
+      var exact = [], i, o;
+      for (i = 0; i < jobs.length; i++) { o = jobs[i]; if (o.name === name) exact.push(o); }
+      if (exact.length === 1) return exact[0];
+      if (exact.length > 1 && comp) { for (i = 0; i < exact.length; i++) { if (exact[i].company === comp) return exact[i]; } }
+      var byComp = [];
+      for (i = 0; i < jobs.length; i++) { o = jobs[i]; if (comp && o.company === comp) byComp.push(o); }
+      if (byComp.length === 1 && byComp[0].name === name) return byComp[0];
+      if (name.length >= 2 && comp) {
+        for (i = 0; i < jobs.length; i++) {
+          o = jobs[i];
+          if (o.company === comp && (o.name.indexOf(name) >= 0 || name.indexOf(o.name) >= 0)) return o;
+        }
+      }
+      return null;
+    };
+    var annotate = function () {
+      var cards = document.querySelectorAll('.job-card');
+      var done = 0;
+      for (var i = 0; i < cards.length; i++) {
+        var card = cards[i];
+        if (card.getAttribute('data-bossclaw-jobdetail')) { done += 1; continue; }
+        var nameEl = card.querySelector('.vue-clamp__text');
+        var name = nameEl ? norm(nameEl.getAttribute('aria-label') || nameEl.textContent) : '';
+        if (!name) continue;
+        var compEl = card.querySelector('.job-card__company-name');
+        var comp = compEl ? norm(compEl.textContent) : '';
+        var job = pick(name, comp);
+        if (job) { card.setAttribute('data-bossclaw-jobdetail', detailBase + job.pn + '.htm'); done += 1; }
+      }
+      // 下述盲标兜底仅在「索引可信」（fresh）时启用，任一批与此前标注一致即跳过（防重复替标）
+      if (fresh && done === 0 && inc.selectedJobId && byJobId[String(inc.selectedJobId)]) {
+        var active = document.querySelector('.job-card--active');
+        var aj = byJobId[String(inc.selectedJobId)];
+        if (active && !active.getAttribute('data-bossclaw-jobdetail')) {
+          active.setAttribute('data-bossclaw-jobdetail', detailBase + aj.pn + '.htm');
+        }
+      }
+      if (fresh && done === 0 && cards.length === jobs.length && cards.length > 0) {
+        for (var k = 0; k < cards.length; k++) {
+          var c2 = cards[k];
+          if (!c2.getAttribute('data-bossclaw-jobdetail')) c2.setAttribute('data-bossclaw-jobdetail', detailBase + jobs[k].pn + '.htm');
+        }
+      }
+    };
+    annotate();
+    var annotatePending = false;
+    var mo = new MutationObserver(function () {
+      if (annotatePending) return;
+      annotatePending = true;
+      setTimeout(function () { annotatePending = false; annotate(); }, 300);
+    });
+    mo.observe(document.body, { childList: true, subtree: true });
+
+    // ===== 列表接口旁路监听：把「滚动 / 翻页加载出来的岗位」并入索引 =====
+    // SSR 的 positionList 只有首屏那批，后续岗位由页面自己 POST /c/i/search/positions 取回并渲染
+    // → 这些卡既没有 jobdetail 锚点、也不在索引里，于是拿不到岗位号（列表级采集的 JD 补齐
+    // 靠 number 查详情，没 number 就补不了）。
+    // 该接口**无法由我们直接调用**（2026-09 实测：匿名 POST 返回 code 200 但 count=0 /
+    // isVerification=1，需浏览器自身的校验），所以改为在主世界包一层 XHR / fetch，
+    // 只**读**页面自己的响应，把里面「有 number + 岗位名」的对象并入 jobs 索引 → 再 annotate()。
+    // 安全：包装是纯透传（不改参数、不改返回值）；解不出结构时天然 no-op；索引增长只影响标注，
+    // 而标注仍需「岗位名 + 公司名」精确匹配，不会误标。
+    var absorbed = {};
+    var ABSORB_KEYS = ['positionList', 'list', 'results', 'positions', 'data'];
+    var absorbOne = function (o) {
+      var name = norm(o.positionName) || norm(o.name);
+      var pn = norm(o.positionNumber) || norm(o.number);
+      if (!name || !pn || absorbed[pn]) return;
+      absorbed[pn] = 1;
+      var jobId = String(o.jobId != null ? o.jobId : pn);
+      jobs.push({ name: name, company: norm(o.companyName), pn: pn, jobId: jobId });
+      if (jobId && !byJobId[jobId]) byJobId[jobId] = jobs[jobs.length - 1];
+    };
+    var absorbPayload = function (root, depth) {
+      if (!root || typeof root !== 'object' || depth > 4) return;
+      if (Array.isArray(root)) {
+        for (var i = 0; i < root.length; i++) {
+          var it = root[i];
+          if (it && typeof it === 'object' && (it.number || it.positionNumber) && (it.name || it.positionName)) absorbOne(it);
+          else if (it && typeof it === 'object') absorbPayload(it, depth + 1);
+        }
+        return;
+      }
+      for (var k = 0; k < ABSORB_KEYS.length; k++) { if (root[ABSORB_KEYS[k]]) absorbPayload(root[ABSORB_KEYS[k]], depth + 1); }
+    };
+    var isListApi = function (u) { return String(u == null ? '' : u).indexOf('/c/i/search/positions') >= 0; };
+    var absorbText = function (text) {
+      if (!text || String(text).length > 4000000) return; // 防御：异常大响应不解析
+      try {
+        var before = jobs.length;
+        absorbPayload(JSON.parse(text), 0);
+        if (jobs.length > before) annotate();
+      } catch (e) {}
+    };
+    try {
+      var XO = XMLHttpRequest.prototype.open;
+      var XS = XMLHttpRequest.prototype.send;
+      XMLHttpRequest.prototype.open = function (m, u) { try { this.__bcUrl = u; } catch (e) {} return XO.apply(this, arguments); };
+      XMLHttpRequest.prototype.send = function () {
+        var self = this;
+        try {
+          self.addEventListener('load', function () {
+            try { if (isListApi(self.__bcUrl) && self.responseType !== 'json') absorbText(self.responseText); } catch (e) {}
+          });
+        } catch (e) {}
+        return XS.apply(this, arguments);
+      };
+      if (window.fetch) {
+        var OF = window.fetch;
+        window.fetch = function (input, init) {
+          var u = (input && input.url) ? input.url : input;
+          var p = OF.apply(this, arguments);
+          try {
+            if (isListApi(u) && p && p.then) {
+              p.then(function (res) {
+                try { if (res && res.clone) res.clone().text().then(absorbText).catch(function () {}); } catch (e) {}
+                return res;
+              }).catch(function () {});
+            }
+          } catch (e) {}
+          return p;
+        };
+      }
+    } catch (e) {}
+
+    document.addEventListener('click', function (e) {
+      var t = e.target;
+      var card = t && t.closest ? t.closest('.job-card') : null;
+      if (!card) return;
+      if (t.closest && t.closest('a')) return; // 放行卡片内公司名等真实链接
+      var nameEl = card.querySelector('.vue-clamp__text');
+      var name = nameEl ? norm(nameEl.getAttribute('aria-label') || nameEl.textContent) : '';
+      if (!name) return;
+      var compEl = card.querySelector('.job-card__company-name');
+      var comp = compEl ? norm(compEl.textContent) : '';
+      var job = pick(name, comp);
+      if (!job) return;
+      if (e.preventDefault) e.preventDefault();
+      if (e.stopPropagation) e.stopPropagation();
+      if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+      location.href = detailBase + job.pn + '.htm?from=bossclaw';
+    }, true);
+  })();`;
+  mainWindow.webContents.on('did-attach-webview', (_e, wc) => {
+    // ===== 弹窗 / 新标签（target=_blank / window.open）处理：当前标签内导航 =====
+    // 根因：Electron <webview> 不会向宿主派发 new-window DOM 事件（webViewEvents 白名单
+    // 不含它，渲染层 addEventListener('new-window') 永远不触发），且 webview 未设
+    // allowpopups → guest disablePopups=true，新窗口请求被静默 deny —— 表现为智联首页/
+    // 搜索页点 target=_blank 链接「没反应」，只能右键「在新标签打开链接」。
+    // 修复：在主进程对每个 guest webContents 注册 setWindowOpenHandler —— http(s) 弹窗
+    // 在当前标签内 loadURL（点击即跳转，与旧渲染层注释的意图一致）；非网页协议
+    // （占位弹窗 / javascript: 等）一律 deny，交页面自身降级，行为与 disablePopups 相同。
+    try {
+      wc.setWindowOpenHandler(({ url }) => {
+        const u = String(url || '');
+        if (/^https?:\/\//i.test(u)) { try { wc.loadURL(u); } catch {} }
+        return { action: 'deny' };
+      });
+    } catch {}
+    wc.on('did-finish-load', () => {
+      try {
+        const url = wc.getURL?.() || '';
+        let hostname = '';
+        try { hostname = new URL(url).hostname.toLowerCase(); } catch {}
+        if (hostname !== 'www.zhaopin.com' && !hostname.endsWith('.zhaopin.com')) return;
+        if (/\/jobdetail\//i.test(url)) return; // 详情页本身不注入
+        wc.executeJavaScript(ZP_DETAIL_NAV_SCRIPT, true).catch(() => {});
+      } catch {}
+    });
+  });
+
+  // ===== webview 诊断（写 userData/bossclaw-webview-diag.log；排查 preload 注入/IPC 失效）=====
+  // ⚠️ 落盘受 isDebugEnabled() 门控（审查 #12，见下方 webviewDiag）：仅 BOSSCLAW_DEBUG=1 或未打包版写盘。
+  let webviewDiagPath = null;
+  try { webviewDiagPath = path.join(app.getPath('userData'), 'bossclaw-webview-diag.log'); } catch {}
+  // 审查 #12：诊断落盘必须**与 dlog 同一开关门控**。原实现无条件 appendFileSync，且 console-message
+  // 命中正则（preload|uncaught|typeerror|is not 等常见字样）就调用 —— 报错频繁的站点会每秒大量同步写盘，
+  // **用同步磁盘 IO 阻塞主进程事件循环**（窗口卡顿），而该文件对正式包用户无价值。
+  // 需要诊断时置 BOSSCLAW_DEBUG=1（或跑未打包版本）即可恢复完整落盘。
+  // 注意：渲染层的 'jc:webview-diag' IPC 不受影响（应用内诊断面板仍可见）。
+  const webviewDiag = (m) => {
+    if (!webviewDiagPath || !isDebugEnabled()) return;
+    try { fs.appendFileSync(webviewDiagPath, `[${new Date().toISOString()}] ${m}\n`); } catch {}
+  };
+  mainWindow.webContents.on('did-attach-webview', (_e, wc) => {
+    let wpref = 'n/a';
+    try {
+      const prefs = wc.getLastWebPreferences?.() || {};
+      wpref = JSON.stringify({ preload: prefs.preload, sandbox: prefs.sandbox, nodeIntegration: prefs.nodeIntegration, partition: prefs.partition });
+    } catch {}
+    webviewDiag('ATTACH url=' + (wc.getURL?.() || '') + ' prefs=' + wpref);
+    try { mainWindow?.webContents.send('jc:webview-diag', { type: 'attach', prefs: wpref, url: wc.getURL?.() || '' }); } catch {}
+
+    // ===== 主世界反检测补丁注入（路线 A 阶段 1）=====
+    // 为什么不能在 preload 里改：<webview preload> 与 session.setPreloads 都运行在**隔离世界**
+    //   （contextIsolation:true，AGENTS.md §3.1 已记录），隔离世界的 navigator 与页面主世界不共享，
+    //   在 preload 里 Object.defineProperty(navigator, ...) 对页面完全无效。
+    //   因此补丁字符串必须由主进程 executeJavaScript 注入到**主世界**。
+    // 时机：did-start-loading（尽早）+ dom-ready（兜底）；补丁内有 __bossclawStealth 幂等守卫，
+    //   重复注入无副作用。更早的一枪由 webview.cjs 在 preload 阶段用 webFrame.executeJavaScript 打出。
+    // 开关：环境变量 BOSSCLAW_STEALTH（off / only=a,b / skip=a,b），项名见 stealth.PATCH_KEYS。
+    let stealthEnabled = [];
+    try { stealthEnabled = stealth.resolveEnabled(); } catch (e) { stealthEnabled = []; }
+    if (stealthEnabled.length > 0) {
+      const stealthCode = stealth.buildStealthScript({ enabled: stealthEnabled, profile: stealth.resolveProfile() });
+      const injectStealth = (when) => {
+        try {
+          wc.executeJavaScript(stealthCode, true)
+            .then(() => { webviewDiag('STEALTH-INJECTED[' + when + '] ' + stealthEnabled.join(',')); })
+            .catch((err) => {
+              webviewDiag('STEALTH-FAILED[' + when + '] ' + String((err && err.message) || err).slice(0, 200));
+              dlog('warn', 'stealth inject failed', { when, message: err?.message });
+            });
+        } catch (e) {
+          dlog('warn', 'stealth inject threw', { when, message: e?.message });
+        }
+      };
+      wc.on('did-start-loading', () => injectStealth('did-start-loading'));
+      wc.on('dom-ready', () => injectStealth('dom-ready'));
+      webviewDiag('STEALTH-ARMED ' + stealthEnabled.join(','));
+    } else {
+      webviewDiag('STEALTH-OFF (BOSSCLAW_STEALTH=' + String(process.env.BOSSCLAW_STEALTH || '') + ')');
+    }
+
+    wc.on('preload-error', (_ev, err, code) => {
+      webviewDiag('PRELOAD-ERROR code=' + code + ' err=' + String(err || '').slice(0, 300));
+      try { mainWindow?.webContents.send('jc:webview-diag', { type: 'preload-error', errorCode: code, error: String(err || '').slice(0, 300) }); } catch {}
+    });
+    // ===== preload 注入判定（以「preload 自身事实」为权威，与渲染层同一口径）=====
+    // 根因：<webview> 继承宿主 webPreferences（contextIsolation: true），preload 运行在**隔离世界**，
+    //   其 window.__bossclawPreload 对主世界不可见 —— 旧实现用主世界 executeJavaScript 探测，
+    //   恒为 null，于是 diag 日志把「注入成功」全部误报成 NOT-INJECTED
+    //   （真机实测 584/584 全为误报，同期 preload-error 为 0，preload 自报标记正常）。
+    // 权威信号 = preload 顶层输出的 `BOSS-CLAW-PRELOAD-INJECTED` console 标记（本 guest 捕获）。
+    let preloadSeen = false;
+    wc.on('console-message', (...args) => {
+      const cm = parseConsoleMessage(...args);
+      const m = String(cm.message || '');
+      if (m.includes('BOSS-CLAW-PRELOAD-INJECTED')) preloadSeen = true;
+      if (/preload|uncaught|referenceerror|typeerror|is not|BOSS-CLAW/i.test(m)) webviewDiag('CONSOLE[' + cm.level + '] ' + m.slice(0, 300));
+    });
+    wc.on('dom-ready', async () => {
+      webviewDiag('DOM-READY url=' + (wc.getURL?.() || ''));
+      let check = preloadSeen
+        ? 'INJECTED(preload 顶层标记已捕获)'
+        : 'NOT-SEEN(preload 顶层标记未捕获，需查 preload 路径 / preload-error)';
+      if (!preloadSeen) {
+        // 兜底：到隔离世界（preload 所在世界）再探测一次，避免 console 事件偶发丢失造成误判
+        try {
+          const v = await wc.executeJavaScriptInIsolatedWorld(999, [{ code: 'String((window.__bossclawPreload) || "")' }]);
+          const got = Array.isArray(v) ? String(v[0] || '') : String(v || '');
+          if (got) check = 'INJECTED(隔离世界探测 ts=' + got + ')';
+        } catch (e) { check += ' / probe-error=' + String((e && e.message) || e).slice(0, 120); }
+      }
+      webviewDiag('PRELOAD-CHECK ' + check);
+      // 同步推送到渲染进程日志区（用户无需翻 diag 文件）
+      try { mainWindow?.webContents.send('jc:webview-diag', { type: 'preload-check', result: check, url: wc.getURL?.() || '' }); } catch {}
+    });
+  });
+
+  mainWindow.once('ready-to-show', () => {
+    // 显式重设窗口图标：确保 Windows 任务栏缩略图/右键预览小窗（取 ICON_SMALL）也用 BossClaw 而非 Electron 默认。
+    if (process.platform === 'win32' && !APP_ICON.isEmpty()) mainWindow.setIcon(APP_ICON);
+    mainWindow.show();
+  });
+  mainWindow.on('closed', () => { mainWindow = null; });
+
+  // ===== P30：渲染进程崩溃自愈 + 无响应检测 =====
+  // 背景：网络卡顿/大对象序列化可能导致渲染进程崩溃（render-process-gone）或主线程无响应
+  // （unresponsive）。原实现无任何处理——崩溃后窗口变白、点击无反应，用户关窗即整个应用退出。
+  // 这里做兜底：崩溃后自动 reload（限频防死循环）；无响应时记录日志便于定位。
+  let rendererGoneCount = 0;
+  let rendererGoneWindowStart = 0;
+  mainWindow.webContents.on('render-process-gone', (_event, details) => {
+    const reason = String((details && details.reason) || 'unknown');
+    const exitCode = details && details.exitCode;
+    dlog('error', 'renderer-gone', { reason, exitCode, count: rendererGoneCount + 1 });
+    if (reason === 'clean-exit') return; // 正常退出（非崩溃）不处理
+    // 限频防死循环：60s 窗口内超过 3 次崩溃则不再自动 reload，避免「崩→刷→崩」无限循环
+    const now = Date.now();
+    if (now - rendererGoneWindowStart > 60000) {
+      rendererGoneWindowStart = now;
+      rendererGoneCount = 0;
+    }
+    rendererGoneCount += 1;
+    if (rendererGoneCount > 3) {
+      dlog('warn', 'renderer-gone 超过限频，停止自动 reload，等待用户操作');
+      return;
+    }
+    setTimeout(() => {
+      try {
+        if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.webContents.isDestroyed()) {
+          dlog('info', 'renderer-gone 自动 reload', { reason });
+          mainWindow.webContents.reload();
+        }
+      } catch (e) {
+        dlog('warn', 'renderer-gone reload 失败', { message: e && e.message });
+      }
+    }, 600);
+  });
+  // 主线程无响应/恢复：仅记录（自动杀进程风险大，等 Chromium 自行恢复；日志供根因定位）
+  mainWindow.webContents.on('unresponsive', () => {
+    dlog('warn', 'renderer-unresponsive 渲染进程主线程长时间无响应');
+  });
+  mainWindow.webContents.on('responsive', () => {
+    dlog('info', 'renderer-responsive 渲染进程已恢复响应');
+  });
+
+  // 通知渲染进程窗口最大化状态变化（自绘标题栏「最大化/还原」图标随状态切换）
+  mainWindow.on('maximize', () => mainWindow.webContents.send('jc:window-maximized-changed', true));
+  mainWindow.on('unmaximize', () => mainWindow.webContents.send('jc:window-maximized-changed', false));
+  // 通知渲染进程窗口置顶状态变化（标题栏图钉按钮随状态切换）
+  mainWindow.on('always-on-top-changed', (_event, isOnTop) =>
+    mainWindow.webContents.send('jc:window-always-on-top-changed', Boolean(isOnTop))
+  );
+  mainWindow.on('focus', () => mainWindow.webContents.send('jc:window-focus-changed', true));
+  mainWindow.on('blur', () => mainWindow.webContents.send('jc:window-focus-changed', false));
+
+  // 拦截新窗口：外部链接交系统浏览器
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (/^https?:\/\//.test(url)) shell.openExternal(url);
+    return { action: 'deny' };
+  });
+
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    const isDevOrigin = url === DEV_URL || url.startsWith(DEV_URL + '/');
+    if (!url.startsWith('file://') && !isDevOrigin) {
+      event.preventDefault();
+      shell.openExternal(url);
+    }
+  });
+
+  return mainWindow;
+}
+
+// 前端请求打开外部链接
+ipcMain.on('jc:open-external', (_event, url) => {
+  if (url && /^https?:\/\//.test(url)) shell.openExternal(url);
+});
+
+// 前端获取应用信息（名称、版本等）
+safeHandle('jc:app-info', () => ({
+  name: app.getName(),
+  version: app.getVersion(),
+}));
+
+// 读取「使用前必读」文档（首页「阅读使用文档」入口）。
+// 用户文档源统一为 desktop-app/resources/docs/（随应用分发）：
+// 打包版 = resources/docs/（extraResources 拷贝）；开发版 = app 目录下 resources/docs/。
+safeHandle('jc:read-doc', async () => {
+  const candidates = [
+    path.join(process.resourcesPath, 'docs', '使用前必读.md'),
+    path.join(__dirname, '..', 'resources', 'docs', '使用前必读.md'),
+  ];
+  for (const p of candidates) {
+    try {
+      const text = await fs.promises.readFile(p, 'utf8');
+      return { ok: true, text, file: p };
+    } catch {
+      /* 尝试下一个候选路径 */
+    }
+  }
+  return { ok: false, error: '未找到「使用前必读」文档（resources/docs/使用前必读.md）' };
+});
+
+// 剪贴板写入（右键「查看网页源码」Modal 的复制按钮用；渲染进程 navigator.clipboard 在 file:// 下不可靠）
+safeHandle('jc:clipboard-write', (_event, text) => {
+  try { clipboard.writeText(String(text ?? '')); return { ok: true }; } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
+});
+
+/**
+ * 给 Promise 加超时（毫秒）：`printToPDF` / 隐藏窗口 `loadURL` 偶发挂死时 Promise 永不 settle，
+ * 会让渲染层「导出中」永久卡住、隐藏打印窗口不被回收（见审查 #77）。超时即 reject，由既有 catch 收口。
+ */
+function withTimeout(promise, ms, label) {
+  let timer = null;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${label} 超时（${ms}ms）`)), ms);
+    }),
+  ]).finally(() => { if (timer) clearTimeout(timer); });
+}
+
+// 保存定制简历 PDF：渲染进程传 A4 打印 HTML → 隐藏窗口 printToPDF → 系统保存对话框 → 写盘。
+// 排版完全由 HTML/CSS 控制（resumePdf.ts 的 moderncv 风格模板），@page 控制页边距，
+// printToPDF 传 margins:'none' 避免与 CSS 边距叠加。零额外依赖、中文由系统字体渲染。
+const { validatePdfItem, writeUniquePdf } = require('./resume-pdf-batch.cjs');
+async function renderResumePdf(htmlText) {
+  const printWin = new BrowserWindow({
+    show: false, width: 842, height: 1191,
+    webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false },
+  });
+  try {
+    await withTimeout(printWin.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(htmlText)), 15_000, '打印页加载');
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    const pdf = await withTimeout(printWin.webContents.printToPDF({
+      pageSize: 'A4', printBackground: true, margins: { marginType: 'none' },
+    }), 30_000, 'PDF 生成');
+    if (!pdf || !pdf.length) throw new Error('PDF 生成结果为空');
+    return pdf;
+  } finally {
+    try { printWin.destroy(); } catch {}
+  }
+}
+
+safeHandle('jc:save-pdf', async (_event, defaultName, html) => {
+  const name = String(defaultName || '').trim();
+  if (!/^[\w\u4e00-\u9fa5()（）\-· ]{1,120}\.pdf$/i.test(name)) {
+    return { ok: false, error: '文件名不合法（须以 .pdf 结尾）' };
+  }
+  const htmlText = String(html || '');
+  if (htmlText.length < 200 || !/<!DOCTYPE html>/i.test(htmlText)) {
+    return { ok: false, error: 'HTML 内容不完整，无法生成 PDF' };
+  }
+  const { canceled, filePath } = await dialog.showSaveDialog(mainWindow, {
+    title: '保存定制简历',
+    defaultPath: path.join(app.getPath('documents'), name),
+    filters: [
+      { name: 'PDF 文档', extensions: ['pdf'] },
+      { name: '所有文件', extensions: ['*'] },
+    ],
+  });
+  if (canceled || !filePath) return { ok: false, canceled: true };
+
+  try {
+    const pdf = await renderResumePdf(htmlText);
+    await fs.promises.writeFile(filePath, pdf);
+    return { ok: true, filePath };
+  } catch (e) {
+    dlog('error', 'printToPDF failed', { message: (e && e.message) || String(e) });
+    return { ok: false, error: String((e && e.message) || e) };
+  }
+});
+
+const pdfBatchSessions = new Map();
+safeHandle('jc:save-pdf-batch-cancel', async (event, requestId) => {
+  const batch = pdfBatchSessions.get(String(requestId));
+  if (!batch || batch.senderId !== event.sender.id) return { ok: false };
+  batch.stopped = true;
+  return { ok: true };
+});
+
+safeHandle('jc:save-pdf-batch', async (event, input, requestId) => {
+  if (!Array.isArray(input) || !input.length || input.length > 1000) return { ok: false, error: '请选择 1–1000 份简历', results: [] };
+  let items;
+  try { items = input.map(validatePdfItem); }
+  catch (error) { return { ok: false, error: error.message, results: [] }; }
+  const id = String(requestId || `${event.sender.id}_${Date.now()}`).slice(0, 120);
+  if (pdfBatchSessions.has(id)) return { ok: false, error: '这批简历正在导出', results: [] };
+  const batch = { senderId: event.sender.id, stopped: false };
+  pdfBatchSessions.set(id, batch);
+  const results = [];
+  let directory;
+  try {
+    const picked = await dialog.showOpenDialog(mainWindow, {
+      title: '选择批量简历保存目录', properties: ['openDirectory', 'createDirectory'],
+    });
+    if (picked.canceled || !picked.filePaths?.[0]) return { ok: false, canceled: true, results, total: items.length };
+    directory = picked.filePaths[0];
+    for (const item of items) {
+      if (batch.stopped || event.sender.isDestroyed()) break;
+      try {
+        const pdf = await renderResumePdf(item.html);
+        const filePath = await writeUniquePdf(directory, item.fileName, pdf);
+        results.push({ fileName: item.fileName, ok: true, filePath });
+      } catch (error) {
+        results.push({ fileName: item.fileName, ok: false, error: String(error?.message || error) });
+      }
+      if (!event.sender.isDestroyed()) event.sender.send('jc:save-pdf-batch-progress', {
+        requestId: id, completed: results.length, total: items.length, fileName: item.fileName,
+      });
+    }
+    return { ok: !batch.stopped && results.length === items.length && results.every((r) => r.ok),
+      canceled: batch.stopped, directory, results, total: items.length };
+  } catch (error) {
+    return { ok: false, directory, results, error: String(error?.message || error), total: items.length };
+  } finally {
+    pdfBatchSessions.delete(id);
+  }
+});
+
+// ===== 通用文本导出（CSV）：渲染层拼好文本 → 系统保存对话框 → 写盘 =====
+// 口径：**每次导出都必须由用户选择保存位置**（不做静默落盘、不记忆目录）。
+// 扩展名走白名单（默认只允许 .csv），避免误导出可执行文件；
+// 文本已由渲染层带上 UTF-8 BOM，Excel / WPS 双击不会中文乱码。
+safeHandle('jc:save-file', async (_event, defaultName, content, extWhitelist) => {
+  const name = String(defaultName || '').trim();
+  const text = String(content ?? '');
+  const allowed = (Array.isArray(extWhitelist) && extWhitelist.length ? extWhitelist : ['csv']).map((e) =>
+    String(e).replace(/^\./, '').toLowerCase()
+  );
+  const m = /^([\w\u4e00-\u9fa5()（）\-· ]{1,120})\.([A-Za-z0-9]{1,8})$/.exec(name);
+  if (!m) return { ok: false, error: '文件名不合法（须为「名称.扩展名」）' };
+  const ext = m[2].toLowerCase();
+  if (!allowed.includes(ext)) {
+    return { ok: false, error: `不支持的文件类型 .${ext}（仅支持 ${allowed.map((e) => `.${e}`).join(' / ')}）` };
+  }
+  if (!text) return { ok: false, error: '导出内容为空' };
+  const { canceled, filePath } = await dialog.showSaveDialog(mainWindow, {
+    title: '导出数据',
+    defaultPath: path.join(app.getPath('documents'), name),
+    filters: [
+      { name: ext === 'csv' ? 'CSV 数据表' : `${ext.toUpperCase()} 文件`, extensions: [ext] },
+      { name: '所有文件', extensions: ['*'] },
+    ],
+  });
+  if (canceled || !filePath) return { ok: false, canceled: true };
+  try {
+    await fs.promises.writeFile(filePath, text, 'utf8');
+    return { ok: true, filePath };
+  } catch (e) {
+    dlog('error', 'save-file failed', { message: (e && e.message) || String(e) });
+    return { ok: false, error: String((e && e.message) || e) };
+  }
+});
+
+// ===== 统计数据报表 PDF：渲染层传横向 A4 打印 HTML → 隐藏窗口 printToPDF → 保存对话框 =====
+// 与 jc:save-pdf 的区别：本通道固定 **A4 横版**（统计页是宽幅布局），且对话框标题独立，
+// 避免复用简历通道时出现「保存定制简历」这类错位标题。同样必须由用户选择保存位置。
+safeHandle('jc:save-report-pdf', async (_event, defaultName, html) => {
+  const name = String(defaultName || '').trim();
+  if (!/^[\w\u4e00-\u9fa5()（）\-· ]{1,120}\.pdf$/i.test(name)) {
+    return { ok: false, error: '文件名不合法（须以 .pdf 结尾）' };
+  }
+  const htmlText = String(html || '');
+  if (htmlText.length < 200 || !/<!DOCTYPE html>/i.test(htmlText)) {
+    return { ok: false, error: 'HTML 内容不完整，无法生成 PDF' };
+  }
+  const { canceled, filePath } = await dialog.showSaveDialog(mainWindow, {
+    title: '导出统计报表',
+    defaultPath: path.join(app.getPath('documents'), name),
+    filters: [
+      { name: 'PDF 文档', extensions: ['pdf'] },
+      { name: '所有文件', extensions: ['*'] },
+    ],
+  });
+  if (canceled || !filePath) return { ok: false, canceled: true };
+
+  // 隐藏打印窗口：不启用 Node 能力，纯渲染 HTML（无脚本），保证安全；横版按 842×1191 倒置预置
+  const printWin = new BrowserWindow({
+    show: false,
+    width: 1191,
+    height: 842,
+    webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false },
+  });
+  try {
+    await withTimeout(printWin.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(htmlText)), 15_000, '报表页加载');
+    await new Promise((r) => setTimeout(r, 400));
+    const pdf = await withTimeout(printWin.webContents.printToPDF({
+      pageSize: 'A4',
+      landscape: true,
+      printBackground: true,
+      margins: { marginType: 'none' },
+    }), 30_000, '报表 PDF 生成');
+    if (!pdf || !pdf.length) return { ok: false, error: 'PDF 生成结果为空' };
+    await fs.promises.writeFile(filePath, pdf);
+    return { ok: true, filePath };
+  } catch (e) {
+    dlog('error', 'report printToPDF failed', { message: (e && e.message) || String(e) });
+    return { ok: false, error: String((e && e.message) || e) };
+  } finally {
+    try { printWin.destroy(); } catch {}
+  }
+});
+
+// 在系统文件管理器中定位到指定文件（导出成功后的「打开所在文件夹」）
+safeHandle('jc:show-item', (_event, filePath) => {
+  const p = String(filePath || '').trim();
+  if (!p || !path.isAbsolute(p)) return { ok: false, error: '路径不合法' };
+  try {
+    shell.showItemInFolder(p);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e) };
+  }
+});
+
+// 保存「达标岗位」数据到本地：渲染进程整理好 JSON → 系统保存对话框 → 写盘。
+// 达标 = 岗位分析评分 >= 推荐岗位分（minScore）；达标岗位从工作台队列收集，由渲染层拼好传入。
+// dirOpt 非空且为绝对路径时，直接写入该目录（不弹框，文件名按天自动生成）；否则弹出保存对话框。
+safeHandle('jc:save-qualified-jobs', async (_event, defaultName, jsonText, dirOpt) => {
+  const name = String(defaultName || '').trim();
+  const json = String(jsonText || '');
+  if (!/^[\w\u4e00-\u9fa5()（）\-· ]{1,120}\.json$/i.test(name)) {
+    return { ok: false, error: '文件名不合法（须以 .json 结尾）' };
+  }
+  if (!json) return { ok: false, error: '无有效达标岗位数据' };
+  let filePath;
+  const dir = String(dirOpt || '').trim();
+  if (dir && path.isAbsolute(dir)) {
+    filePath = path.join(dir, name);
+  } else {
+    const res = await dialog.showSaveDialog(mainWindow, {
+      title: '保存达标岗位数据',
+      defaultPath: path.join(app.getPath('documents'), name),
+      filters: [
+        { name: 'JSON 数据', extensions: ['json'] },
+        { name: '所有文件', extensions: ['*'] },
+      ],
+    });
+    if (res.canceled || !res.filePath) return { ok: false, canceled: true };
+    filePath = res.filePath;
+  }
+  await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
+  await fs.promises.writeFile(filePath, json, 'utf8');
+  return { ok: true, filePath };
+});
+
+// ===== 达标岗位导出目录（可选；不设置则每次弹保存框，设置后在指定目录自动按天写文件）=====
+function qualJobsDirCtl() {
+  const pointer = () => path.join(app.getPath('userData'), '.qualified-jobs-dir.txt');
+  const readPointer = () => {
+    try { const d = fs.readFileSync(pointer(), 'utf8').trim(); if (d) return d; } catch {}
+    return '';
+  };
+  return { pointer, readPointer };
+}
+
+safeHandle('jc:qualified-jobs-dir-get', async () => {
+  try { return { dir: qualJobsDirCtl().readPointer() }; }
+  catch (e) { return { dir: '', error: String((e && e.message) || e) }; }
+});
+
+safeHandle('jc:qualified-jobs-dir-set', async (_event, dirPath) => {
+  const dir = String(dirPath || '').trim();
+  if (!dir || !path.isAbsolute(dir)) return { ok: false, error: '导出目录须为绝对路径' };
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(qualJobsDirCtl().pointer(), dir);
+    return { ok: true, dir };
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e) };
+  }
+});
+
+// 系统目录选择对话框 → 持久化为达标岗位导出目录（选择即应用）
+safeHandle('jc:qualified-jobs-dir-pick', async () => {
+  try {
+    const { canceled, filePaths } = await dialog.showOpenDialog(mainWindow, {
+      title: '选择达标岗位导出目录',
+      properties: ['openDirectory', 'createDirectory'],
+    });
+    if (canceled || !filePaths || !filePaths[0]) return { ok: false, canceled: true };
+    const dir = filePaths[0];
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(qualJobsDirCtl().pointer(), dir);
+    return { ok: true, dir };
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e) };
+  }
+});
+
+// ===== 经历补充材料：按路径选择 + 每次调用现读（不落缓存/不持久化内容） =====
+// 口径：渲染层只持有文件绝对路径；正文每次调用 AI 前经 jc:material-read 现读并重新解析，
+// 因此用户在外部改了素材文件即时生效，应用内不保存任何素材内容副本。
+// 素材扩展名白名单（P4-10 双端共享口径：选择对话框 filters 与读取校验必须一致）
+const MATERIAL_EXT_WHITELIST = ['pdf', 'docx', 'doc', 'md', 'markdown', 'txt', 'text'];
+/**
+ * 补充材料「按路径读取」的防护口径（审查 H-6 / M-3 的**替代方案**）。
+ *
+ * 报告原建议「仅允许 `materialPick` 选过的路径」。实测该口径有 UX 回归：用户历史已选的素材
+ * 只记在渲染层 localStorage（`experienceMaterials`），主进程无从知晓 → 升级后全部判为未授权，
+ * 必须逐个重选。而「让渲染层把历史路径注册给主进程」等于把授权面重新交给渲染层，防护价值归零。
+ *
+ * 权衡后的口径：**不做路径预授权**，改为三重收敛 + 既有上限：
+ *   ① 必须绝对路径、存在、是普通文件；
+ *   ② 扩展名白名单（仅文档/文本类，`.env`/`id_rsa`/`.pem`/`.db` 等天然被挡在门外）；
+ *   ③ 敏感文件名 / 敏感目录黑名单（凭据类文件、系统目录、浏览器与云凭据目录）；
+ *   ④ 单文件 ≤20MB（既有）。
+ * 这样可读面收敛到「文档/文本素材」且排除凭据类，同时**不产生任何重选回归**。
+ */
+const MATERIAL_SENSITIVE_NAME_RE =
+  /(?:password|passwd|credential|secret|token|api[_-]?key|id_rsa|id_ed25519|密码|账号|凭据|私钥)/i;
+function isSensitiveMaterialPath(p) {
+  const base = path.basename(p);
+  if (MATERIAL_SENSITIVE_NAME_RE.test(base)) return true;
+  const norm = String(p).replace(/\\/g, '/');
+  const lower = norm.toLowerCase();
+  // 凭据 / 密钥目录
+  if (/(?:^|\/)\.ssh\//.test(lower) || /(?:^|\/)\.gnupg\//.test(lower)) return true;
+  if (/(?:^|\/)\.aws\//.test(lower) || /(?:^|\/)\.config\/gcloud\//.test(lower)) return true;
+  if (/(?:^|\/)\.config\/(?:gh|git)\//.test(lower)) return true;
+  // 系统目录
+  if (/^[a-z]:\/windows\//i.test(norm) || /^[a-z]:\/program files/i.test(norm)) return true;
+  if (/(?:^|\/)appdata\/(roaming|local)\/microsoft\//i.test(lower)) return true;
+  if (/^\/etc\//.test(norm) || /^\/system\//i.test(norm) || /^\/library\//i.test(lower)) return true;
+  // 浏览器/通讯软件配置目录（cookie / 登录态）
+  if (/(?:^|\/)appdata\/(roaming|local)\/(google|mozilla|tencent|microsoft)\//i.test(lower)) return true;
+  return false;
+}
+safeHandle('jc:material-pick', async () => {
+  try {
+    const { canceled, filePaths } = await dialog.showOpenDialog(mainWindow, {
+      title: '选择经历补充材料（PDF / DOCX / DOC / MD / TXT）',
+      properties: ['openFile', 'multiSelections'],
+      filters: [
+        { name: '简历与文本', extensions: MATERIAL_EXT_WHITELIST },
+        { name: '全部文件', extensions: ['*'] },
+      ],
+    });
+    if (canceled || !filePaths || !filePaths.length) return { ok: false, canceled: true };
+    return { ok: true, paths: filePaths.map((p) => ({ path: p, name: path.basename(p) })) };
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e) };
+  }
+});
+
+// 按路径现读文件（不缓存）→ 返回 data URL，供渲染层复用既有解析链路（pdf 文本层 / docx / doc / 纯文本）
+safeHandle('jc:material-read', async (_event, filePath) => {
+  try {
+    const p = String(filePath || '');
+    if (!p || !path.isAbsolute(p)) return { ok: false, error: '文件路径无效（需绝对路径）' };
+    const stat = await fs.promises.stat(p);
+    if (!stat.isFile()) return { ok: false, error: '不是文件' };
+    // 单文件上限 20MB：避免超大素材拖垮解析与内存
+    if (stat.size > 20 * 1024 * 1024) return { ok: false, error: '文件超过 20MB' };
+    // P4-10：扩展名白名单与 jc:material-pick 的 filters 同源
+    const ext = path.extname(p).replace(/^\./, '').toLowerCase();
+    if (!MATERIAL_EXT_WHITELIST.includes(ext)) {
+      return { ok: false, error: `不支持的素材格式：.${ext}（仅 PDF/DOCX/DOC/MD/TXT）` };
+    }
+    // H-6 / M-3：敏感文件名/目录黑名单（凭据类、系统目录、浏览器与云凭据目录）
+    if (isSensitiveMaterialPath(p)) {
+      return { ok: false, error: '拒绝读取：该路径属敏感文件/目录，不可作为简历补充材料' };
+    }
+    const buf = await fs.promises.readFile(p);
+    const mime = ext === 'pdf' ? 'application/pdf' : 'application/octet-stream';
+    return {
+      ok: true,
+      name: path.basename(p),
+      path: p,
+      dataUrl: `data:${mime};base64,${buf.toString('base64')}`,
+      bytes: buf.length,
+    };
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e) };
+  }
+});
+
+// ===== 本地数据备份目录（开机自启动同理，见下方 autostart 段）=====
+// localStorage 为主存储；本地备份目录指针存 userData/.backup-dir.txt（独立于 localStorage，
+// 避免 localStorage 缺失时无法得知恢复来源）。渲染层每 5 分钟脏检查后经此写盘。
+function backupCtl() {
+  const pointer = () => path.join(app.getPath('userData'), '.backup-dir.txt');
+  const defaultDir = () => path.join(app.getPath('userData'), 'backup');
+  const readPointer = () => {
+    try { const d = fs.readFileSync(pointer(), 'utf8').trim(); if (d) return d; } catch {}
+    return defaultDir();
+  };
+  const fileIn = (dir) => path.join(dir, 'bossclaw-local-backup.json');
+  return { pointer, defaultDir, readPointer, fileIn };
+}
+
+/** 校验并持久化一个备份目录（绝对路径；自动创建、拷贝旧备份、写指针） */
+function applyBackupDir(dir) {
+  if (!path.isAbsolute(dir)) return { ok: false, error: '备份目录须为绝对路径' };
+  const ctl = backupCtl();
+  const oldDir = ctl.readPointer();
+  fs.mkdirSync(dir, { recursive: true });
+  // 旧目录存在备份文件且新目录无 → 拷贝，避免切换丢数据
+  if (oldDir !== dir) {
+    const src = ctl.fileIn(oldDir);
+    const dst = ctl.fileIn(dir);
+    if (fs.existsSync(src) && !fs.existsSync(dst)) {
+      try { fs.copyFileSync(src, dst); } catch (e) { dlog('warn', 'backup dir copy failed', { message: e?.message }); }
+    }
+  }
+  fs.writeFileSync(ctl.pointer(), dir);
+  return { ok: true, dir };
+}
+
+safeHandle('jc:backup-dir-get', async () => {
+  try { return { dir: backupCtl().readPointer() }; }
+  catch (e) { return { dir: backupCtl().defaultDir(), error: String(e?.message || e) }; }
+});
+
+safeHandle('jc:backup-dir-set', async (_event, dirPath) => {
+  try {
+    return applyBackupDir(String(dirPath || '').trim());
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e) };
+  }
+});
+
+// 系统目录选择对话框 → 持久化为备份目录（选择即应用）
+safeHandle('jc:backup-dir-pick', async () => {
+  try {
+    const { canceled, filePaths } = await dialog.showOpenDialog(mainWindow, {
+      title: '选择本地备份目录',
+      properties: ['openDirectory', 'createDirectory'],
+    });
+    if (canceled || !filePaths || !filePaths[0]) return { ok: false, canceled: true };
+    return applyBackupDir(filePaths[0]);
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e) };
+  }
+});
+
+safeHandle('jc:backup-write', async (_event, bundle) => {
+  const ctl = backupCtl();
+  const dir = ctl.readPointer();
+  const filep = ctl.fileIn(dir);
+  // 审查 #29：临时文件名必须**每次唯一**。固定 `filep + '.tmp'` 时，两次并发写（心跳与
+  // 「立即备份」重叠、或多实例同时写同一目录）会写到同一个 tmp 再各自 rename ——
+  // writeFile 截断 + 交叉写入 → rename 后可能得到一个内容残缺的备份文件（而它会被当作
+  // 「完好备份」，直接毁掉恢复源）。唯一名 + rename 保证「要么旧文件、要么新文件」。
+  const tmp = `${filep}.tmp-${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  try {
+    await fs.promises.mkdir(dir, { recursive: true });
+    // 渲染层已按 '{"updatedAt":N,"keys":…}' 拼好文本直传；旧对象格式仍兼容（手动兜底序列化）
+    const text = typeof bundle === 'string' ? bundle : JSON.stringify(bundle ?? {});
+    if (text.length < 4) return { ok: false, error: '备份内容为空' };
+    // 异步原子写（tmp + rename）：不阻塞主进程事件循环（同步 writeFileSync 在大包/慢盘时会卡窗口），
+    // 中途失败也不会损坏上一次完好备份
+    await fs.promises.writeFile(tmp, text, 'utf8');
+    await fs.promises.rename(tmp, filep);
+    return { ok: true, file: filep, size: Buffer.byteLength(text) };
+  } catch (e) {
+    try { if (fs.existsSync(tmp)) await fs.promises.unlink(tmp); } catch { /* 清理失败忽略 */ }
+    return { ok: false, error: String((e && e.message) || e) };
+  }
+});
+
+safeHandle('jc:backup-read', async () => {
+  try {
+    const ctl = backupCtl();
+    const filep = ctl.fileIn(ctl.readPointer());
+    if (!fs.existsSync(filep)) return { ok: false, file: null };
+    const raw = fs.readFileSync(filep, 'utf8');
+    let parsed = null;
+    try { parsed = JSON.parse(raw); } catch { parsed = null; }
+    if (!parsed) return { ok: false, file: null, error: '备份文件损坏' };
+    return { ok: true, file: filep, bundle: parsed };
+  } catch (e) {
+    return { ok: false, file: null, error: String((e && e.message) || e) };
+  }
+});
+
+safeHandle('jc:backup-delete', async () => {
+  try {
+    const ctl = backupCtl();
+    const filep = ctl.fileIn(ctl.readPointer());
+    if (fs.existsSync(filep)) fs.unlinkSync(filep);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e) };
+  }
+});
+
+// ===== 开机自启动（Windows 登录项）=====
+safeHandle('jc:autostart-get', async () => {
+  try {
+    const st = app.getLoginItemSettings();
+    return { ok: true, openAtLogin: Boolean(st.openAtLogin) };
+  } catch (e) {
+    return { ok: false, openAtLogin: false, error: String((e && e.message) || e) };
+  }
+});
+
+safeHandle('jc:autostart-set', async (_event, enabled) => {
+  try {
+    app.setLoginItemSettings({ openAtLogin: Boolean(enabled) });
+    return { ok: true, enabled: Boolean(enabled) };
+  } catch (e) {
+    return { ok: false, enabled: Boolean(enabled), error: String((e && e.message) || e) };
+  }
+});
+
+// ===== 出网请求统一护栏（M-1 / L-2：SSRF 与响应体体积放大防护）=====
+/** 内网 / 环回 / 链路本地 / 元数据地址（SSRF 目标） */
+function isPrivateOutboundHost(hostname) {
+  const h = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
+  if (!h) return true;
+  if (h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.local') || h.endsWith('.internal')) return true;
+  if (h === '::1' || h === '0.0.0.0') return true;
+  if (/^127\./.test(h) || /^10\./.test(h) || /^192\.168\./.test(h) || /^169\.254\./.test(h)) return true;
+  if (/^172\.(1[6-9]|2\d|3[01])\./.test(h)) return true;
+  if (/^(?:fc|fd|fe80)/.test(h)) return true;
+  return false;
+}
+/** 出网 URL 校验：协议 + host 策略。allowLoopback=true 时放行本机地址（本地 LLM 场景）。 */
+function outboundUrlCheck(raw, { allowLoopback = false, requireHttpsOffLoopback = false } = {}) {
+  let parsed;
+  try { parsed = new URL(String(raw || '')); } catch { return { ok: false, error: 'invalid url' }; }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return { ok: false, error: '仅支持 http(s) 地址' };
+  const priv = isPrivateOutboundHost(parsed.hostname);
+  if (priv && !allowLoopback) return { ok: false, error: `拒绝访问内网/环回/元数据地址：${parsed.hostname}` };
+  // 公网明文 HTTP 会泄露 API Key，强制 https（本机回环允许 http，供本地模型服务使用）
+  if (requireHttpsOffLoopback && !priv && parsed.protocol !== 'https:') {
+    return { ok: false, error: '非本机地址必须使用 https（避免 API Key 明文传输）' };
+  }
+  return { ok: true, url: parsed.toString() };
+}
+/** 响应体硬上限（L-2）：流式累计，超限即取消，避免超大响应打爆主进程内存 */
+const OUTBOUND_MAX_BYTES = 32 * 1024 * 1024;
+async function readResponseTextCapped(res, maxBytes = OUTBOUND_MAX_BYTES) {
+  const body = res.body;
+  if (!body || typeof body.getReader !== 'function') return await res.text();
+  const reader = body.getReader();
+  const decoder = new TextDecoder('utf-8');
+  let total = 0;
+  let out = '';
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value || !value.byteLength) continue;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        try { await reader.cancel(); } catch { /* 忽略 */ }
+        throw new Error(`响应体超过 ${maxBytes} 字节上限，已中止`);
+      }
+      out += decoder.decode(value, { stream: true });
+    }
+    out += decoder.decode();
+    return out;
+  } finally {
+    try { reader.releaseLock(); } catch { /* 忽略 */ }
+  }
+}
+
+// 通用 URL 抓取（CORS 无关，供渲染进程获取 BOSS 公开接口，如城市编码表）。
+// 在主进程用 Node 原生 fetch 请求，避免渲染进程跨域限制。
+safeHandle('jc:fetch-url', async (_event, url) => {
+  try {
+    const chk = outboundUrlCheck(url);
+    if (!chk.ok) return { ok: false, error: chk.error };
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 15000);
+    try {
+      const res = await fetch(chk.url, {
+        signal: ctrl.signal,
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+      });
+      const text = await readResponseTextCapped(res);
+      return { ok: res.ok, status: res.status, text };
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e) };
+  }
+});
+
+// P05：LLM 主进程代理（对齐 AGENTS.md「LLM 经预加载脚本代理真实请求」架构约定）。
+// 渲染层不再直连 provider（规避部分端点 CORS 失败、统一主进程超时/错误口径），经此转发。
+// M-1：允许本机地址（本地模型服务如 Ollama），但**公网必须 https**（防 API Key 明文传输）；
+//     响应体加 32MB 上限（L-2），避免超大响应撑爆主进程内存。
+safeHandle('jc:llm-proxy', async (_event, url, payload, apiKey, timeoutMs = 90000) => {
+  const chk = outboundUrlCheck(url, { allowLoopback: true, requireHttpsOffLoopback: true });
+  if (!chk.ok) return { ok: false, status: 0, text: '', error: chk.error };
+  const target = chk.url;
+  // P1-11：apiKey 从网页复制常带尾部空格/换行，trim 后再拼 Authorization 头，
+  // 否则 fetch 会抛 `TypeError: Invalid value` 且被下面 catch 吞成模糊的失败信息。
+  const key = String(apiKey || '').trim();
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), Math.max(1000, Number(timeoutMs) || 90000));
+  try {
+    const res = await fetch(target, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
+      body: typeof payload === 'string' ? payload : JSON.stringify(payload),
+      signal: ctrl.signal,
+    });
+    const text = await readResponseTextCapped(res);
+    return { ok: res.ok, status: res.status, text };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    const timedOut = /aborted?|timeout/i.test(msg);
+    return {
+      ok: false, status: 0, text: '',
+      error: timedOut ? 'timeout' : msg,
+      // P1-11：区分「超时 / 请求头非法 / 网络」，供渲染层给用户可定位的提示
+      hint: timedOut
+        ? '请求超时：可增大模型请求超时上限或检查网络'
+        : /invalid/i.test(msg)
+          ? '请求头非法：请检查 API Key 是否包含多余空格或换行'
+          : '网络请求失败：请检查网络连通性或服务地址',
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+});
+
+// 窗口控制（frame:false 自绘标题栏按钮用）
+ipcMain.on('jc:window-minimize', () => mainWindow?.minimize());
+ipcMain.on('jc:window-maximize', () => {
+  if (!mainWindow) return;
+  mainWindow.isMaximized() ? mainWindow.unmaximize() : mainWindow.maximize();
+});
+ipcMain.on('jc:window-close', () => mainWindow?.close());
+ipcMain.handle('jc:window-is-maximized', () => mainWindow?.isMaximized() ?? false);
+// 窗口置顶（标题栏图钉按钮）：查询当前置顶状态 / 切换
+ipcMain.handle('jc:window-always-on-top', () => mainWindow?.isAlwaysOnTop() ?? false);
+ipcMain.on('jc:window-always-on-top-set', (_event, value) => mainWindow?.setAlwaysOnTop(Boolean(value)));
+
+// 检查 BOSS 直聘登录态：以 webview 持久化会话（persist:bossclaw）中的 wt2 主会话 cookie 为准。
+// wt2 是 zhipin.com 的登录主 cookie，未登录时不存在；过期 cookie 不会由 Electron 返回。
+// 多平台适配：同分区同时上报 猎聘/智联/51Job 的登录态（各自鉴权 cookie 名）。
+// 匹配规则：`=name` = 精确匹配（短名如 at/rt 必须精确，防子串误伤）；
+//           数组 = 成对条件（如智联 SPA 的 at+rt 需同时存在才认登录）；
+//           其余 = 子串匹配（与 camoufox_server.py PLATFORM_AUTH_COOKIE_HINTS 尽量保持一致；
+//           该表在 Python 侧做同构扩展（=精确/数组成对）后需同步回这里）。
+const WEBVIEW_AUTH_COOKIE_HINTS = {
+  boss: ['wt2'],
+  liepin: ['lp_login', 'lp_token', 'token'],
+  zhaopin: ['zp_auto', 'zp_sign', 'swordman', 'zm_job_pc', ['=at', '=rt']],
+  job51: ['j_ticket', 'sajssp', '51job', 'job51'],
+};
+const WEBVIEW_PLATFORM_DOMAIN = {
+  boss: 'zhipin.com',
+  liepin: 'liepin.com',
+  zhaopin: 'zhaopin.com',
+  job51: '51job.com',
+};
+function cookieUrl(c) {
+  if (c.url) return c.url;
+  const d = String(c.domain || '').replace(/^\.+/, '');
+  return `https://${d || 'localhost'}`;
+}
+safeHandle('jc:boss-login', async () => {
+  try {
+    const ses = session.fromPartition('persist:bossclaw');
+    const all = await ses.cookies.get({});
+    // 登录态判定必须**按平台域名收口**：持久化会话同时存着 4 个平台的 cookie，
+    // 候选名只做子串匹配的话，智联等平台的「token 系」cookie 会误命中猎聘的通用候选 token，
+    // 导致「智联已登录却显示猎聘已登录」。域名不一致的 cookie 一律不参与判定。
+    // 命中规则：`=name` 精确匹配；数组内的多个候选需同域名同时存在（成对 token）；
+    // 其余按子串匹配（沿用历史候选的宽松语义）。
+    const domainOk = (c, md) => {
+      if (!md) return true;
+      const d = String(c.domain || '').toLowerCase().replace(/^\.+/, '');
+      return !d || d === md || d.endsWith('.' + md);
+    };
+    const nameHit = (name, pat) =>
+      pat.startsWith('=') ? name === pat.slice(1) : name.includes(pat);
+    const hasAuth = (pf, hints) => {
+      const md = String(WEBVIEW_PLATFORM_DOMAIN[pf] || '').toLowerCase();
+      return hints.some((h) => {
+        const pats = Array.isArray(h) ? h : [h];
+        return pats.every((p) =>
+          all.some((c) => Boolean(c.value) && domainOk(c, md) && nameHit(c.name.toLowerCase(), p))
+        );
+      });
+    };
+    const platforms = Object.fromEntries(
+      Object.entries(WEBVIEW_AUTH_COOKIE_HINTS).map(([pf, hints]) => [pf, hasAuth(pf, hints)]),
+    );
+    const wt2 = all.find((c) => c.name === 'wt2');
+    return { loggedIn: Boolean(wt2 && wt2.value), cookie: Boolean(wt2), platforms };
+  } catch (e) {
+    return { loggedIn: false, error: String((e && e.message) || e) };
+  }
+});
+
+// 清除指定平台在 persist:bossclaw 会话中的登录态 cookie（设置页「退出登录」用）
+safeHandle('jc:boss-logout', async (_event, platform) => {
+  try {
+    const target = String(platform || '');
+    const hints = WEBVIEW_AUTH_COOKIE_HINTS[target] || [];
+    const domainHint = WEBVIEW_PLATFORM_DOMAIN[target];
+    const ses = session.fromPartition('persist:bossclaw');
+    const all = await ses.cookies.get({});
+    let removed = 0;
+    for (const c of all) {
+      const name = String(c.name || '').toLowerCase();
+      const domain = String(c.domain || '').toLowerCase();
+      // 与 jc:boss-login 的 hasAuth 同口径（审查 #100）：
+      //   · `=name` → 精确匹配（短名如 at/rt 只能精确，防子串误伤其它平台）；
+      //   · 数组 → 数组内**任一**命中即可（退出登录的语义是「尽量清干净」，不像登录那样要求成对）；
+      //   · 其余 → 子串匹配（沿用历史候选的宽松语义）。
+      // 原实现直接 `name.includes(h)`：当 h 是数组时 `String(['=at','=rt']) === '=at,=rt'` **永不命中**，
+      // 智联的短名 cookie 只能靠域名兜底 —— 而域名兜底又会连带清掉同域其它 cookie。
+      const matchHint = hints.some((h) => {
+        const pats = Array.isArray(h) ? h : [h];
+        return pats.some((p) => {
+          const pat = String(p);
+          return pat.startsWith('=') ? name === pat.slice(1) : name.includes(pat);
+        });
+      });
+      const matchDomain = domainHint && (() => {
+        // M-4：改为后缀匹配（原 `domain.includes(hint)` 会让 `evilzhipin.com` 命中 `zhipin.com`）
+        const d = domain.replace(/^\./, '');
+        return d === domainHint || d.endsWith('.' + domainHint);
+      })();
+      if (matchHint || matchDomain) {
+        try {
+          await ses.cookies.remove(cookieUrl(c), c.name);
+          removed += 1;
+        } catch {}
+      }
+    }
+    dlog('info', 'boss-logout', { platform: target, removed });
+    return { ok: true, removed };
+  } catch (e) {
+    dlog('error', 'boss-logout failed', { error: String((e && e.message) || e) });
+    return { ok: false, error: String((e && e.message) || e) };
+  }
+});
+
+// ===== 可信输入通道（Electron 版 CDP 输入）=====
+// BOSS 聊天框是 React/Slate/Lexical 受控 contenteditable，只认真实浏览器输入（isTrusted:true），
+// 会丢弃 webview preload 里 dispatchEvent 合成的 beforeinput/input/paste 事件（合成事件 isTrusted=false）。
+// 参考实现：job-claw-main 用 chrome.debugger CDP Input.insertText + Input.dispatchKeyEvent(rawKeyDown Enter)；
+//           boss-auto-job-main 用 Playwright fill()/type()（底层同为 CDP 真实输入）。
+// Electron <webview> 无 CDP，等价物是 webContents.insertText()/selectAll()/delete()/sendInputEvent()。
+// 由 webview preload（webview.cjs）直接 ipcRenderer.send 到本主进程，event.sender 即 guest webContents。
+ipcMain.on('jc:webview-input', (event, payload) => {
+  const wc = event.sender;
+  // P4-12：主进程侧频率兜底（渲染层自律之外的最后防线）。
+  // ⚠️ 阈值与「单次业务动作消耗的信道消息数」绑定，改动输入链路时必须同步复核：
+  //   收口到真事件通道后，一次投递 = 立即沟通点击 + insertText + 发送点击（＋偶发弹窗确认）
+  //   ≈ 3~4 条消息；ActionPacer 允许 8 动作/分钟 → 峰值约 32 条/分钟。
+  //   旧阈值 16 是按「1 动作 ≈ 1~2 消息」定的，收口后会**把正常投递误判为输入风暴**，故同步上调。
+  // 双层判定：60 条/60s（均值）+ 20 条/10s（突发）；**按发送方标签页独立计数**（审查 #14）。
+  // 目标是拦「渲染层 bug 引发的输入风暴」（量级是数百/分钟），而非给正常业务动作设卡。
+  const now = Date.now();
+  // 按发送方（guest webContents）分桶计数（审查 #14）：跨标签页互不挤占额度。
+  const window60 = inputWindowFor(wc.id);
+  // 审查 H-14：`once('destroyed')` 只注册一次（原实现每条消息都注册 → 同一 webContents 线性累积
+  // 监听器，长会话可达上万，触发 MaxListenersExceededWarning 与内存泄漏）。用 WeakSet 去重。
+  if (!wc.isDestroyed() && !inputDestroyHooked.has(wc)) {
+    inputDestroyHooked.add(wc);
+    try { wc.once('destroyed', () => inputWindows.delete(wc.id)); } catch {}
+  }
+  const live = window60.filter((t) => t > now - 60_000);
+  if (live.length !== window60.length) { window60.length = 0; window60.push(...live); }
+  const burst = window60.filter((t) => t > now - 10_000).length;
+  if (window60.length >= 60 || burst >= 20) {
+    try { wc.send('jc:webview-input-done', { seq: String((payload && payload.seq) || ''), ok: false, action: String((payload && payload.action) || ''), error: 'rate limited' }); } catch {}
+    dlog('warn', 'webview-input rate limited（主进程兜底）', { senderId: wc.id, perMinute: window60.length, perTenSec: burst });
+    return;
+  }
+  window60.push(now);
+  // ⚠️ 严禁 Number() 强转：preload 的 seq 是 "时间戳_随机数" 字符串，Number() 后变 NaN→0，
+  // 回执 seq 与请求不匹配，preload 的 trustedInput 会每 4s 超时一次（3 次=13s）且永远配对不上。
+  const seq = String((payload && payload.seq) || '');
+  const action = String((payload && payload.action) || '');
+  const text = String((payload && payload.text) || '');
+  const reply = (result) => { try { wc.send('jc:webview-input-done', { seq, ...result }); } catch {} };
+  // preload 的 getBoundingClientRect 返回网页 CSS 坐标；sendInputEvent 使用
+  // guest webContents 的 DIP 坐标。只乘 guest 页面缩放，不能再乘 Windows DPR、
+  // 宿主缩放或 webview 在窗口中的偏移。缩放 125% 时旧代码会误点到输入框。
+  const nativeMousePoint = (x, y) => {
+    const zoom = wc.getZoomFactor();
+    if (!Number.isFinite(zoom) || zoom <= 0) throw new Error('invalid guest zoom');
+    return { x: Math.round(x * zoom), y: Math.round(y * zoom) };
+  };
+  // 沿人类化轨迹逐点移动鼠标，走完再执行收尾动作（点击 / 仅悬停）。
+  // 轨迹由 preload 侧 humanize.cjs 生成（纯函数、可离线回归），这里只负责「按顺序发事件」。
+  // 为什么合成在一处：整条轨迹只占 **1 条信道消息**，不会因分段移动而吃掉频率预算。
+  const walkPathThen = (points, finish) => {
+    const list = Array.isArray(points) ? points : [];
+    let i = 0;
+    const step = () => {
+      try {
+        if (i >= list.length) { finish(); return; }
+        const p = list[i++];
+        const px = Math.round(Number(p && p.x));
+        const py = Math.round(Number(p && p.y));
+        if (Number.isFinite(px) && Number.isFinite(py)) wc.sendInputEvent({ type: 'mouseMove', ...nativeMousePoint(px, py) });
+        const delay = Math.min(Math.max(Number(p && p.delayMs) || 0, 0), 120);
+        if (delay > 0) setTimeout(step, delay);
+        else step();
+      } catch (e) {
+        // 轨迹只是「锦上添花」，任一步失败都必须确保收尾动作照常执行，否则业务空转
+        try { finish(); } catch {}
+      }
+    };
+    step();
+  };
+
+  try {
+    switch (action) {
+      case 'clickAt': {
+        // 真实鼠标点击（isTrusted:true）：与 insertText/pressEnter 同源思路。
+        // 背景：BOSS「立即沟通」对 preload 里 dispatchEvent 的合成点击**完全不响应**
+        // （线上实测：点击后按钮仍在、无弹窗、无输入框、无导航、无风控），
+        // 必须由主进程 sendInputEvent 产生可信鼠标事件。请求中的坐标为网页 CSS 视口坐标。
+        const x = Math.round(Number(payload && payload.x));
+        const y = Math.round(Number(payload && payload.y));
+        if (!Number.isFinite(x) || !Number.isFinite(y)) return reply({ ok: false, action, error: 'bad coords' });
+        const fire = () => {
+          const point = nativeMousePoint(x, y);
+          wc.sendInputEvent({ type: 'mouseMove', ...point });
+          wc.sendInputEvent({ type: 'mouseDown', ...point, button: 'left', clickCount: 1 });
+          wc.sendInputEvent({ type: 'mouseUp', ...point, button: 'left', clickCount: 1 });
+          reply({ ok: true, action, x, y, path: Array.isArray(payload && payload.path) ? payload.path.length : 0 });
+        };
+        // 有轨迹则先「移过去」再点：消除「光标瞬移 + 立即点击」这一最容易被行为层识别的特征。
+        // 无轨迹时保持旧行为（单点移动 + 点击），保证既有调用方不受影响。
+        const path = (payload && payload.path) || [];
+        if (Array.isArray(path) && path.length > 1) walkPathThen(path, fire);
+        else fire();
+        return;
+      }
+      case 'hoverAt': {
+        // 纯悬停（不按键）：用于「移动到输入框再输入」，补上「零鼠标移动直接打字」的破绽。
+        const pts = (payload && payload.path) || [];
+        const finish = () => reply({ ok: true, action });
+        if (Array.isArray(pts) && pts.length) walkPathThen(pts, finish);
+        else finish();
+        return;
+      }
+      case 'insertText':
+        if (!text) return reply({ ok: false, action, error: 'empty text' });
+        wc.insertText(text);
+        return reply({ ok: true, action });
+      case 'selectAll':
+        wc.selectAll();
+        return reply({ ok: true, action });
+      case 'delete':
+        wc.delete();
+        return reply({ ok: true, action });
+      case 'pressEnter': {
+        // 与 CDP rawKeyDown(Enter, text:'\r') + keyUp 等价：真实回车触发发送
+        wc.sendInputEvent({ type: 'keyDown', keyCode: 'Return' });
+        wc.sendInputEvent({ type: 'char', keyCode: '\r' });
+        wc.sendInputEvent({ type: 'keyUp', keyCode: 'Return' });
+        return reply({ ok: true, action });
+      }
+      default:
+        return reply({ ok: false, action, error: 'unknown action: ' + action });
+    }
+  } catch (e) {
+    dlog('error', 'webview-input failed', { action, message: e?.message });
+    return reply({ ok: false, action, error: String((e && e.message) || e) });
+  }
+});
+
+// 前端请求启动/停止/暂停桥接
+ipcMain.on('jc:bridge-control', (_event, type) => {
+  if (type === 'start' && !bridgeProcess) startBridge();
+  if (type === 'stop' && bridgeProcess) { try { bridgeProcess.kill(); } catch {} bridgeProcess = null; }
+});
+
+// ===== 本地桥令牌（C-2：随机生成 + 本机私有文件，不再随前端打包分发）=====
+// 与 bridge/server.cjs 的 resolveBridgeToken 同口径：env 优先 → 运行时文件 → 生成并落盘。
+// 渲染层经本 IPC 取令牌后以请求头 X-Bossclaw-Token 调用本地桥，避免令牌出现在 URL/日志中。
+function bridgeTokenPath() {
+  return path.join(app.getPath('home'), '.bossclaw', 'bridge-token');
+}
+function resolveBridgeToken() {
+  const fromEnv = String(process.env.BOSSCLAW_BRIDGE_TOKEN || '').trim();
+  if (fromEnv) return fromEnv;
+  const tokenPath = bridgeTokenPath();
+  try {
+    const existing = fs.readFileSync(tokenPath, 'utf8').trim();
+    if (existing) return existing;
+  } catch { /* 不存在则生成 */ }
+  const generated = crypto.randomBytes(24).toString('hex');
+  try {
+    fs.mkdirSync(path.dirname(tokenPath), { recursive: true });
+    fs.writeFileSync(tokenPath, generated, { mode: 0o600, flag: 'wx' });
+    return generated;
+  } catch {
+    try {
+      const existing = fs.readFileSync(tokenPath, 'utf8').trim();
+      if (existing) return existing;
+    } catch { /* 读回失败则退回本次生成 */ }
+    return generated;
+  }
+}
+safeHandle('jc:bridge-token', () => resolveBridgeToken());
+
+// 说明：不启用 app.requestSingleInstanceLock()——该 API 在部分受限/沙箱环境下
+// 无其他实例时也会返回 false 导致主进程直接退出（实测 WorkBuddy 沙箱复现）。
+// 进程去重由启动脚本 start-bossclaw.cmd 在启动前统一清理旧进程完成。
+app.whenReady().then(async () => {
+  // 数据版本重置：v3 重建后首次启动清空旧登录态/缓存（一次性，见 resetDataForVersion）。
+  // 必须 await 完成后再创建窗口——否则清理会与用户「首次启动后立即登录」的写入竞态。
+  await resetDataForVersion();
+  // 移除默认应用菜单栏（File / Edit / View / Window / Help）
+  Menu.setApplicationMenu(null);
+
+  // ===== webview persist:bossclaw session 预热（减少首次加载慢问题）=====
+  // 在 createMainWindow 之前就初始化 session，使 session 配置在 webview 挂载时已生效。
+  // 提前初始化还可以触发 session 的磁盘缓存预热，减少 BOSS 首页冷加载延迟。
+  try {
+    const bossclawSession = session.fromPartition('persist:bossclaw');
+
+    // ===== webview preload 双保险：session 级注入（绕过 webview 元素 preload 属性的各种问题）=====
+    // <webview> 的 preload 属性要求 file: 协议且须在元素初始化时就位；sandbox:true 时还可能被忽略。
+    // session.setPreloads 是官方机制，对 persist:bossclaw 会话内每个页面（含 webview guest）注入 preload。
+    // webview.cjs 内部有防重复注入保护（window.__bossclawWebviewPreload），双路径同时生效也不会重复注册。
+    const preloadPath = path.join(__dirname, 'preload', 'webview.cjs');
+    // Electron 42 起 setPreloads / getPreloads 已弃用（官方标注 "will be removed"），
+    // 替代品为 registerPreloadScript（参数 { type, id?, filePath }，filePath 须绝对路径，返回 script id）。
+    // 这里做双版本兼容：新 API 存在则优先用，否则回落旧 API —— 便于在升级分支与 main 之间来回切换。
+    try {
+      if (typeof bossclawSession.registerPreloadScript === 'function') {
+        const preloadId = bossclawSession.registerPreloadScript({ type: 'frame', id: 'bossclaw-webview-preload', filePath: preloadPath });
+        const applied = (typeof bossclawSession.getPreloadScripts === 'function') ? JSON.stringify(bossclawSession.getPreloadScripts()) : 'n/a';
+        console.log('REGISTER-PRELOAD-SCRIPT id=' + preloadId + ' file=' + preloadPath + ' applied=' + applied);
+      } else {
+        bossclawSession.setPreloads([preloadPath]);
+        const applied = (typeof bossclawSession.getPreloads === 'function') ? JSON.stringify(bossclawSession.getPreloads()) : 'n/a';
+        console.log('SET-PRELOADS preload=' + preloadPath + ' applied=' + applied);
+      }
+    } catch (e) {
+      dlog('error', 'preload 注册失败', { message: e?.message });
+    }
+
+    // ===== 目标浏览器画像：UA + 请求头 + JS 层三处同源（唯一权威 = stealth.cjs）=====
+    // 画像来源 = 用户抓包得到的「真机浏览器 → www.zhipin.com」请求头样本（2026-10-03）。
+    // 三处必须同源，否则会制造「JS 说一套、请求头说另一套」的新矛盾：
+    //   ① setUserAgent              —— UA 字符串
+    //   ② onBeforeSendHeaders       —— 请求头（服务端直接可见，JS 补丁够不到）
+    //   ③ injectStealth（主世界补丁）—— navigator.userAgentData / languages
+    const stealthProfile = stealth.resolveProfile();
+    const realChromeUA = stealth.buildUserAgent(stealthProfile);
+    bossclawSession.setUserAgent(realChromeUA);
+    dlog('info', 'stealth profile', { ua: realChromeUA, brands: stealthProfile.brands });
+
+    // ===== 请求头对齐：根因是「实测 Electron 42（Chromium 148）的导航请求完全不发 Sec-CH-UA 系列头」=====
+    // 而 JS 层 navigator.userAgentData 却存在 → 服务端看到的是「声明有 UA-CH、请求却不带」的自相矛盾。
+    // 这里强制把 Sec-CH-UA / Mobile / Platform / Accept-Language / User-Agent 设为画像值（幂等覆盖）。
+    // 只改这几个头：accept / sec-fetch-* / upgrade-insecure-requests 实测与目标样本已一致，多改易错。
+    try {
+      const headerOverrides = stealth.buildRequestHeaderOverrides(stealthProfile);
+      bossclawSession.webRequest.onBeforeSendHeaders((details, callback) => {
+        try {
+          const h = details.requestHeaders;
+          for (const k of Object.keys(headerOverrides)) h[k] = headerOverrides[k];
+        } catch (e) { /* 单次失败不影响该请求 */ }
+        callback({ requestHeaders: details.requestHeaders });
+      });
+      dlog('info', 'request header overrides armed', headerOverrides);
+    } catch (e) {
+      dlog('warn', 'request header override failed', { message: e?.message });
+    }
+
+    // ===== 磁盘缓存配置：增大缓存上限（默认值偏小，BOSS 首页资源较多）=====
+    // setCacheSize 对 persistent session 有效（Electron 42 亦适用；调用前已做 typeof 能力判断）；
+    // 256MB 缓存可显著减少二次加载时间（JS/CSS/图片缓存命中），冷启动也因缓存预热而加速。
+    if (typeof bossclawSession.setCacheSize === 'function') {
+      bossclawSession.setCacheSize(256 * 1024 * 1024)
+        .then(() => {
+          if (typeof bossclawSession.getCacheSize !== 'function') return;
+          return bossclawSession.getCacheSize();
+        })
+        .then((size) => {
+          if (typeof size === 'number') dlog('info', 'bossclaw session cache size', { size });
+        })
+        .catch(() => {});
+    }
+  } catch (e) { console.error('session init failed:', e); }
+
+  // 桥接服务改为按需启动：由用户在 OpenClaw / 设置页主动「启动/连接」后，
+  // 经 jc:bridge-control(start) IPC 才 spawn；避免「未连接却显示已连接」。
+  createMainWindow();
+  // 后台预热隐身引擎（读取持久化状态 + 预拉起 Python 桥），登录不再承担冷启动卡顿
+  warmUpCamoufox();
+
+  // ===== 本地控制桥（可选；开启条件见 control-bridge.cjs：BOSSCLAW_CONTROL=1 或 --control-bridge）=====
+  // 供 bossclaw-mcp 等外部 agent 读取实时状态 / 执行白名单动作（切页、暂停投递、截图…）。
+  // 只监听 127.0.0.1 且要求 token；单向链路：仅 agent→MCP→应用，应用从不反向调 agent。
+  try {
+    const enablement = resolveEnablement();
+    console.log(`[control-bridge] ${enablement.enabled ? '启用' : '未启用'}（${enablement.via}）`);
+    controlBridge = startControlBridge({
+      app,
+      getWindow: () => mainWindow,
+      log: (level, msg, extra) => dlog(level, msg, extra),
+    });
+  } catch (e) {
+    console.error('[control-bridge] 初始化失败：', e?.message || e);
+  }
+
+  app.on('activate', () => {
+    if (BrowserWindow.getAllWindows().length === 0) createMainWindow();
+  });
+});
+
+
+app.on('window-all-closed', () => {
+  // L-1：macOS 关掉所有窗口后应用仍存活（activate 会重建窗口）。原实现无条件停掉各通道，
+  // 导致重新激活后本地桥/隐身引擎/控制桥全死且不会重启。改为：非 macOS 才停服并退出；
+  // 真正的退出（含 macOS Cmd+Q）由 before-quit 统一收口，保证不留孤儿进程。
+  if (process.platform !== 'darwin') {
+    stopBackgroundServices();
+    app.quit();
+  }
+});
+
+app.on('before-quit', () => {
+  stopBackgroundServices();
+});
+
+/** 统一停掉所有后台服务（本地桥 / 隐身引擎 / 隐身浏览器 / 本地控制桥） */
+function stopBackgroundServices() {
+  if (bridgeProcess) { try { bridgeProcess.kill(); } catch {} bridgeProcess = null; }
+  stopCamoufoxBridge();
+  // 关闭 CloakBrowser 隐身浏览器（如已启动）
+  try { cloakLauncher.stop(); } catch {}
+  // 关闭本地控制桥并清理信息文件（避免残留 stale 记录被 MCP 读到）
+  if (controlBridge) { try { controlBridge.stop(); } catch {} controlBridge = null; }
+}
+
+// ===== CloakBrowser 隐身浏览器 IPC（可选增强）=====
+// 与 webview 路径平行运行；用户在设置页启用后才启动 launcher。
+// 启动前需二进制已下载（首次自动从 cloakbrowser.dev / GitHub Releases 下载 ~200MB 并校验签名）。
+cloakLauncher.setCallbacks({
+  onEvent: (event) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      try { mainWindow.webContents.send('jc:cloak-event', event); } catch {}
+    }
+  },
+  onStatus: (status) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      try { mainWindow.webContents.send('jc:cloak-status-changed', status); } catch {}
+    }
+  },
+  resolveProfileDir: () => {
+    // 持久 profile 路径：<userData>/cloakbrowser-profile；登录态（wt2 等）跨重启保留
+    return path.join(app.getPath('userData'), 'cloakbrowser-profile');
+  },
+});
+
+// 二进制状态探测（不启动浏览器）
+safeHandle('jc:cloak-binary', async () => {
+  try {
+    const info = await cloakLauncher.checkBinary();
+    return { ok: true, binary: info };
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e) };
+  }
+});
+
+// 启动隐身浏览器（首次会自动下载二进制）
+safeHandle('jc:cloak-start', async (_event, opts) => {
+  return await cloakLauncher.start(opts || {});
+});
+
+// 停止隐身浏览器
+safeHandle('jc:cloak-stop', async () => {
+  return await cloakLauncher.stop();
+});
+
+// 当前状态
+safeHandle('jc:cloak-status', async () => ({
+  ready: cloakLauncher.ready,
+  starting: cloakLauncher.starting, // P26：透传 launcher 真实启动态，不再硬编码 false
+  binary: cloakLauncher.binary,
+  lastError: cloakLauncher.lastError,
+}));
+
+// 健康检查：探测 Playwright context 进程是否真的活着（防止 ready=true 但进程已死）。
+// 返回 { ok, alive, reason?, pages }，alive=false 时 UI 走 ensureCloakEngine 自动重启路径。
+safeHandle('jc:cloak-health', async () => {
+  try {
+    return await cloakLauncher.healthCheck();
+  } catch (e) {
+    return { ok: false, alive: false, error: String((e && e.message) || e), pages: 0 };
+  }
+});
+
+// 打开新标签页（返回 tabId）
+safeHandle('jc:cloak-page-new', async (_event, tabId, url) => {
+  return await cloakLauncher.newPage(tabId, url);
+});
+
+// 关闭标签页
+safeHandle('jc:cloak-page-close', async (_event, tabId) => {
+  return await cloakLauncher.closePage(tabId);
+});
+
+// 标签内导航
+safeHandle('jc:cloak-page-navigate', async (_event, tabId, url) => {
+  return await cloakLauncher.navigatePage(tabId, url);
+});
+
+// 后退 / 前进 / 刷新
+safeHandle('jc:cloak-page-back', async (_event, tabId) => {
+  return await cloakLauncher.goBackPage(tabId);
+});
+safeHandle('jc:cloak-page-forward', async (_event, tabId) => {
+  return await cloakLauncher.goForwardPage(tabId);
+});
+safeHandle('jc:cloak-page-reload', async (_event, tabId) => {
+  return await cloakLauncher.reloadPage(tabId);
+});
+
+// 向指定标签发送通道消息（等价于 webview.send）
+safeHandle('jc:cloak-page-send', async (_event, tabId, channel, payload) => {
+  return await cloakLauncher.sendToPage(tabId, channel, payload);
+});
+
+// 真实键盘输入（替换 jc:webview-input；走 Playwright CDP Input 天然 isTrusted:true）
+safeHandle('jc:cloak-page-input', async (_event, tabId, action, text) => {
+  return await cloakLauncher.pageInput(tabId, action, text);
+});
+
+// 列出所有打开的标签
+safeHandle('jc:cloak-page-list', async () => {
+  return { ok: true, pages: cloakLauncher.listPages() };
+});
